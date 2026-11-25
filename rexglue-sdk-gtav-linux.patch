@@ -168,10 +168,10 @@ index d876846..549bdf8 100644
  
 diff --git a/include/rex/filesystem/bridge.h b/include/rex/filesystem/bridge.h
 new file mode 100644
-index 0000000..c8e8dd2
+index 0000000..1e10ea6
 --- /dev/null
 +++ b/include/rex/filesystem/bridge.h
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,49 @@
 +/**
 + * @file        filesystem/bridge.h
 + * @brief       Streams host game data from a bridge server and caches it in place
@@ -202,6 +202,7 @@ index 0000000..c8e8dd2
 +  std::string url;  // http://host:port
 +  std::vector<Root> roots;
 +  bool prefetch = false;  // fill incomplete files in the background
++  uint64_t cache_max_bytes = 0;  // evict least recently read blocks above this; 0 = no limit
 +  int connect_wait_seconds = 60;
 +};
 +
@@ -1463,10 +1464,10 @@ index 4fe1ca6..c5a4199 100644
    // Thread fibers are destroyed from the owning thread itself.
 diff --git a/src/core/filesystem_bridge.cpp b/src/core/filesystem_bridge.cpp
 new file mode 100644
-index 0000000..b0510d0
+index 0000000..3bd8d6c
 --- /dev/null
 +++ b/src/core/filesystem_bridge.cpp
-@@ -0,0 +1,825 @@
+@@ -0,0 +1,954 @@
 +/**
 + * @file        core/filesystem_bridge.cpp
 + * @brief       Bridge client: on-demand block streaming of host game data (see bridge.h and
@@ -1485,6 +1486,7 @@ index 0000000..b0510d0
 +#include <cstring>
 +#include <fstream>
 +#include <mutex>
++#include <shared_mutex>
 +#include <sstream>
 +#include <thread>
 +#include <unordered_map>
@@ -1497,7 +1499,11 @@ index 0000000..b0510d0
 +#include <sys/socket.h>
 +#include <sys/stat.h>
 +#include <unistd.h>
++#if defined(__linux__)
++#include <linux/falloc.h>
++#endif
 +
++#include <fmt/format.h>
 +#include <rex/logging.h>
 +
 +namespace rex::filesystem::bridge {
@@ -1548,6 +1554,25 @@ index 0000000..b0510d0
 +  }
 +  *got = total;
 +  return true;
++}
++
++// Frees the disk space of [offset, offset + len) and leaves a hole that reads as zeros. The
++// range is trimmed to whole 4 KiB pages (APFS needs aligned holes); the bitmap, not the bytes,
++// says what is cached, so a few KiB left behind are harmless.
++bool PunchHole(int fd, uint64_t offset, uint64_t len) {
++  len &= ~uint64_t(4095);
++  if (len == 0) return true;
++#if defined(__APPLE__)
++  fpunchhole_t hole{};
++  hole.fp_offset = static_cast<off_t>(offset);
++  hole.fp_length = static_cast<off_t>(len);
++  return fcntl(fd, F_PUNCHHOLE, &hole) == 0;
++#elif defined(__linux__)
++  return fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(offset),
++                   static_cast<off_t>(len)) == 0;
++#else
++  return false;
++#endif
 +}
 +
 +// Keys are case-folded: the VFS resolves guest names case-insensitively and APFS (the default
@@ -1835,6 +1860,9 @@ index 0000000..b0510d0
 +std::atomic<bool> g_active{false};
 +std::atomic<bool> g_stop{false};
 +std::atomic<int> g_foreground{0};  // threads waiting on a miss (prefetch backs off)
++uint64_t g_cap = 0;                      // cache budget in bytes; 0 = no limit
++std::atomic<uint64_t> g_cached{0};       // bytes of cached blocks in streamed files
++std::atomic<uint32_t> g_tick{1};         // read counter: per-block recency for eviction
 +
 +struct StreamFile {
 +  std::string label;   // root/rel, for logs
@@ -1852,8 +1880,21 @@ index 0000000..b0510d0
 +  std::atomic<uint64_t> present{0};
 +  std::atomic<bool> complete{false};
 +  std::atomic<bool> detached{false};
++  // Made whole for a memory map or stdio (xex, small files): never evicted, since a mapping
++  // would read the holes.
++  std::atomic<bool> pinned{false};
++  // Shared by readers from Ensure through pread; exclusive while a block is evicted.
++  std::shared_mutex evict_mutex;
++  std::unique_ptr<std::atomic<uint32_t>[]> access;  // last-read tick per block
 +
 +  bool Has(uint64_t b) const { return bits[b >> 3] & (1u << (b & 7)); }
++  uint64_t BlockBytes(uint64_t b) const { return std::min(size - b * kBlock, kBlock); }
++  // Caller holds mutex (or the file is not shared yet).
++  uint64_t CachedBytes() const {
++    uint64_t n = 0;
++    for (uint64_t b = 0; b < nblocks; ++b) n += Has(b) ? BlockBytes(b) : 0;
++    return n;
++  }
 +
 +  ~StreamFile() {
 +    if (data_fd >= 0) close(data_fd);
@@ -1920,6 +1961,7 @@ index 0000000..b0510d0
 +      if (!Has(b)) {
 +        bits[b >> 3] |= static_cast<uint8_t>(1u << (b & 7));
 +        present++;
++        g_cached += BlockBytes(b);
 +      }
 +    }
 +    uint64_t first = start >> 3, last = end >> 3;
@@ -1940,8 +1982,13 @@ index 0000000..b0510d0
 +    *out = 0;
 +    if (offset >= size || len == 0) return true;
 +    uint64_t n = std::min<uint64_t>(len, size - offset);
++    std::shared_lock<std::shared_mutex> no_evict(evict_mutex);
++    uint64_t b0 = offset / kBlock, b1 = (offset + n - 1) / kBlock;
++    if (g_cap) {
++      uint32_t tick = g_tick.fetch_add(1, std::memory_order_relaxed);
++      for (uint64_t b = b0; b <= b1; ++b) access[b].store(tick, std::memory_order_relaxed);
++    }
 +    if (!complete) {
-+      uint64_t b0 = offset / kBlock, b1 = (offset + n - 1) / kBlock;
 +      bool missing = false;
 +      {
 +        std::lock_guard<std::mutex> lock(mutex);
@@ -1966,11 +2013,33 @@ index 0000000..b0510d0
 +    return ReadAll(data_fd, buffer, n, offset, out);
 +  }
 +
++  // Drops one cached block (cache over budget). False if it was not evictable.
++  bool Evict(uint64_t b) {
++    std::unique_lock<std::shared_mutex> no_readers(evict_mutex);
++    std::lock_guard<std::mutex> lock(mutex);
++    if (pinned || detached || !Has(b) || inflight[b]) return false;
++    // Bit first: if the hole is not made, the block is just fetched again.
++    bits[b >> 3] &= static_cast<uint8_t>(~(1u << (b & 7)));
++    present--;
++    complete = false;
++    g_cached -= BlockBytes(b);
++    WriteAll(map_fd, bits.data() + (b >> 3), 1, sizeof(MapHeader) + (b >> 3));
++    if (!PunchHole(data_fd, b * kBlock, BlockBytes(b))) {
++      static std::atomic<bool> warned{false};
++      if (!warned.exchange(true)) {
++        REXFS_WARN("bridge: cannot free cache space in {} ({}); the cap is not saving disk",
++                   label, strerror(errno));
++      }
++    }
++    return true;
++  }
++
 +  // The local copy owns the file from now on (the game writes it).
 +  void Detach() {
 +    std::lock_guard<std::mutex> lock(mutex);
 +    if (detached.exchange(true)) return;
 +    complete = true;
++    g_cached -= CachedBytes();  // the local copy owns it: off the cache budget
 +    std::error_code ec;
 +    std::filesystem::remove(map_path, ec);
 +    REXFS_INFO("bridge: {} is local now (opened for writing)", label);
@@ -2095,6 +2164,8 @@ index 0000000..b0510d0
 +  f->nblocks = (e.size + kBlock - 1) / kBlock;
 +  f->bits.assign((f->nblocks + 7) / 8, 0);
 +  f->inflight.assign(f->nblocks, 0);
++  f->access = std::make_unique<std::atomic<uint32_t>[]>(std::max<uint64_t>(f->nblocks, 1));
++  for (uint64_t b = 0; b < f->nblocks; ++b) f->access[b].store(0, std::memory_order_relaxed);
 +
 +  std::filesystem::create_directories(local.parent_path(), ec);
 +  std::filesystem::create_directories(map_path.parent_path(), ec);
@@ -2125,6 +2196,11 @@ index 0000000..b0510d0
 +    for (uint64_t b = 0; b < f->nblocks && !g_stop; b += kMaxRunBlocks) {
 +      if (f->complete || f->detached) break;
 +      while (g_foreground > 0 && !g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(20));
++      // With a cap, fill to 90% and leave the rest for what the game actually reads.
++      if (g_cap && g_cached >= g_cap / 10 * 9) {
++        REXFS_INFO("bridge: prefetch stopped at the cache cap ({:.1f} GB)", g_cap / 1e9);
++        return;
++      }
 +      if (!f->Ensure(b, std::min(f->nblocks - 1, b + kMaxRunBlocks - 1), 0)) {
 +        std::this_thread::sleep_for(std::chrono::seconds(5));  // server away; try again later
 +        b -= std::min(b, kMaxRunBlocks);
@@ -2133,6 +2209,46 @@ index 0000000..b0510d0
 +    if (g_stop) return;
 +  }
 +  REXFS_INFO("bridge: prefetch finished");
++}
++
++// Keeps the cache under g_cap: drops the least recently read blocks down to 95% of the cap.
++void EvictLoop() {
++  bool warned_pinned = false;
++  while (!g_stop) {
++    std::this_thread::sleep_for(std::chrono::seconds(1));
++    if (g_cached <= g_cap) continue;
++    struct Candidate {
++      uint32_t tick;
++      StreamFile* file;
++      uint64_t block;
++    };
++    std::vector<Candidate> candidates;
++    for (auto& f : g_order) {
++      if (f->pinned || f->detached) continue;
++      std::lock_guard<std::mutex> lock(f->mutex);
++      for (uint64_t b = 0; b < f->nblocks; ++b) {
++        if (f->Has(b) && !f->inflight[b]) {
++          candidates.push_back({f->access[b].load(std::memory_order_relaxed), f.get(), b});
++        }
++      }
++    }
++    std::sort(candidates.begin(), candidates.end(),
++              [](const Candidate& a, const Candidate& b) { return a.tick < b.tick; });
++    uint64_t target = g_cap / 100 * 95, freed = 0;
++    for (const auto& c : candidates) {
++      if (g_cached <= target || g_stop) break;
++      if (c.file->Evict(c.block)) freed += c.file->BlockBytes(c.block);
++    }
++    if (freed) {
++      REXFS_INFO("bridge: cache over its {:.1f} GB cap; freed {:.0f} MB of least recently read data",
++                 g_cap / 1e9, freed / 1e6);
++    }
++    if (g_cached > g_cap && !warned_pinned) {
++      warned_pinned = true;
++      REXFS_WARN("bridge: {:.1f} GB is pinned (mapped or small files); above the {:.1f} GB cap",
++                 g_cached / 1e9, g_cap / 1e9);
++    }
++  }
 +}
 +
 +void ReportLoop() {
@@ -2150,10 +2266,10 @@ index 0000000..b0510d0
 +    uint64_t dm = misses - last_misses;
 +    REXFS_INFO(
 +        "bridge: {:.1f} MB in 10 s ({:.1f} MB/s), {} misses (avg wait {:.1f} ms), {} errors; "
-+        "cache {:.0f}/{:.0f} MB, {}/{} files complete",
++        "cache {:.0f}/{:.0f} MB{}, {}/{} files complete",
 +        (bytes - last_bytes) / 1e6, (bytes - last_bytes) / 1e7, dm,
 +        dm ? (wait - last_wait) / 1e3 / dm : 0.0, g_stats.errors.load(), cached / 1e6, total / 1e6,
-+        done, g_order.size());
++        g_cap ? fmt::format(" (cap {:.0f} MB)", g_cap / 1e6) : std::string(), done, g_order.size());
 +    last_bytes = bytes;
 +    last_misses = misses;
 +    last_wait = wait;
@@ -2164,6 +2280,7 @@ index 0000000..b0510d0
 +
 +bool Start(const Options& options) {
 +  if (g_active) return true;
++  g_cap = options.cache_max_bytes;
 +  if (options.roots.empty() || !g_client.Init(options.url)) {
 +    REXFS_ERROR("bridge: bad url '{}'", options.url);
 +    return false;
@@ -2228,7 +2345,11 @@ index 0000000..b0510d0
 +      local_owned++;
 +      continue;
 +    }
-+    if (!f->complete && f->size <= kSmallFile) small.push_back(f);
++    if (f->size <= kSmallFile) {
++      f->pinned = true;
++      if (!f->complete) small.push_back(f);
++    }
++    g_cached += f->CachedBytes();
 +    g_files[Key(f->local)] = f;
 +    g_order.push_back(f);
 +  }
@@ -2253,6 +2374,10 @@ index 0000000..b0510d0
 +
 +  g_active.store(true, std::memory_order_release);
 +  std::thread(ReportLoop).detach();
++  if (g_cap) {
++    REXFS_INFO("bridge: cache cap {:.1f} GB", g_cap / 1e9);
++    std::thread(EvictLoop).detach();
++  }
 +  if (options.prefetch && online) std::thread(PrefetchLoop).detach();
 +  return true;
 +}
@@ -2267,7 +2392,9 @@ index 0000000..b0510d0
 +
 +std::unique_ptr<FileHandle> OpenStreamed(const std::filesystem::path& path) {
 +  auto f = Find(path);
-+  if (!f || f->complete) return nullptr;
++  // A complete file normally gets a plain handle. With a cap its blocks may be evicted later, so
++  // it stays on the streaming handle unless pinned.
++  if (!f || (f->complete && (!g_cap || f->pinned))) return nullptr;
 +  return std::make_unique<StreamHandle>(path, std::move(f));
 +}
 +
@@ -2278,7 +2405,10 @@ index 0000000..b0510d0
 +    f->Detach();
 +    return true;
 +  }
++  // Pinned before filling, under the readers' lock, so eviction can't race the fill.
++  f->pinned = true;
 +  if (!f->complete) {
++    std::shared_lock<std::shared_mutex> no_evict(f->evict_mutex);
 +    g_foreground++;
 +    bool ok = f->EnsureAll();
 +    g_foreground--;
@@ -4131,7 +4261,7 @@ index 754fa13..b1006d6 100644
      REXSYS_ERROR(
          "GPU plugin '{}' not found at {}. Stage it next to the executable "
 diff --git a/src/system/runtime.cpp b/src/system/runtime.cpp
-index c10694c..f08548d 100644
+index c10694c..9915698 100644
 --- a/src/system/runtime.cpp
 +++ b/src/system/runtime.cpp
 @@ -11,6 +11,7 @@
@@ -4142,7 +4272,7 @@ index c10694c..f08548d 100644
  #include <rex/filesystem/devices/host_path_device.h>
  #include <rex/filesystem/devices/null_device.h>
  #include <rex/filesystem/vfs.h>
-@@ -31,6 +32,11 @@
+@@ -31,6 +32,14 @@
  REXCVAR_DEFINE_STRING(game_data_root, "", "Runtime", "Override game data path");
  REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
  REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
@@ -4151,10 +4281,13 @@ index c10694c..f08548d 100644
 +                      "http://mymac.local:7360; fetched data is cached in the data folders");
 +REXCVAR_DEFINE_BOOL(bridge_prefetch, false, "Runtime",
 +                    "With bridge_url: fill the local cache in the background while playing");
++REXCVAR_DEFINE_INT32(bridge_cache_max_gb, 0, "Runtime",
++                     "With bridge_url: cap the local cache (GB); least recently read data is "
++                     "dropped and fetched again when needed. 0 = no limit");
  REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
  REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
  
-@@ -114,6 +120,21 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
+@@ -114,6 +123,23 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
  
    tool_mode_ = config.tool_mode;
  
@@ -4164,6 +4297,8 @@ index c10694c..f08548d 100644
 +    rex::filesystem::bridge::Options bridge;
 +    bridge.url = REXCVAR_GET(bridge_url);
 +    bridge.prefetch = REXCVAR_GET(bridge_prefetch);
++    bridge.cache_max_bytes =
++        uint64_t(std::max(0, REXCVAR_GET(bridge_cache_max_gb))) * 1000 * 1000 * 1000;
 +    bridge.roots.push_back({"game", game_data_root_});
 +    if (!update_data_root_.empty()) bridge.roots.push_back({"update", update_data_root_});
 +    if (!user_data_root_.empty() && user_data_root_ != game_data_root_) {

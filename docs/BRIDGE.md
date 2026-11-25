@@ -67,6 +67,23 @@ server's means the Mac's file changed: reset the placeholder.
 It goes in Documents, not Library/Caches, because the OS may purge Caches and a purged
 placeholder would break the game mid-run. `UIFileSharingEnabled` already exposes Documents.
 
+## Cache size
+
+Without a cap, the cache grows to at most the size of the game data (16.4 GB) and nothing is
+dropped. `--bridge_cache_max_gb=N` caps it. Once a second, if the cached blocks of streamed files
+add up to more than N GB, the least recently read blocks are dropped. Each is cleared in the
+bitmap first, then its disk space is freed with a hole (`F_PUNCHHOLE` on Apple, `fallocate` on
+Linux), until the cache is back under 95% of the cap. A dropped block is fetched again the next
+time it is read.
+
+- Files made whole for a memory map or stdio (default.xex, default.xexp, every file of 256 KiB
+  or less) are pinned and never dropped: a mapping would read the holes. They count toward the cap.
+- Readers hold a per-file shared lock from the fetch to the `pread`, so a block can't be
+  dropped mid-read. With a cap on, unpinned files stay on the streaming handle even when complete.
+- Prefetch stops at 90% of the cap.
+- Recency is kept in memory only. After a restart every block counts as old, so the first trim
+  falls on blocks this run has not read yet.
+
 ## Network
 
 - The client resolves the name with `getaddrinfo`. Apple's resolver handles mDNS, so
@@ -110,6 +127,10 @@ headset can't reach it.
   16.4 GB: the xex and xexp whole, update.rpf, common.rpf, then install partitions and RPFs in
   blocks. Misses waited 100 to 170 ms on average (5 MiB requests, bound by the USB drive), at 30
   to 42 MB/s while loading.
+
+- 2026-11-25, Mac, `--bridge_cache_max_gb=1`, starting from the 1.6 GB cache above. The cache was
+  trimmed to about 1 GB at start-up and held between 0.97 and 1.02 GB while loading (934 MB on
+  disk). The game kept rendering, with no errors.
 
 ## Test plan
 
