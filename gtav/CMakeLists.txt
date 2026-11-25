@@ -15,8 +15,12 @@ option(GTAV_GAME_DLL "Build gtav_fast.exe against a separately built gtav_game.d
 
 # iOS: the SDK installs runtime libraries only; the codegen tool is the Mac's (it only runs when
 # the generated code is out of date, which a phone build never regenerates).
-if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+# visionOS is built as iOS (GTAV_IOS) plus GTAV_VISIONOS for what differs.
+if(CMAKE_SYSTEM_NAME MATCHES "^(iOS|visionOS)$")
     set(GTAV_IOS TRUE)
+    if(CMAKE_SYSTEM_NAME STREQUAL "visionOS")
+        set(GTAV_VISIONOS TRUE)
+    endif()
     find_package(rexglue 0.10.0 REQUIRED CONFIG)
     if(NOT TARGET rex::rexglue)
         set(GTAV_HOST_REXGLUE "${CMAKE_CURRENT_SOURCE_DIR}/../rexglue-sdk/out/install/mac-arm64/bin/rexglue"
@@ -24,6 +28,16 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
         add_executable(rex::rexglue IMPORTED)
         set_target_properties(rex::rexglue PROPERTIES IMPORTED_LOCATION "${GTAV_HOST_REXGLUE}")
     endif()
+endif()
+
+if(GTAV_VISIONOS AND CMAKE_OSX_SYSROOT MATCHES "[Ss]imulator")
+    set(GTAV_STUB_SDK xrsimulator)
+elseif(GTAV_VISIONOS)
+    set(GTAV_STUB_SDK xros)
+elseif(GTAV_IOS)
+    set(GTAV_STUB_SDK iphoneos)
+else()
+    set(GTAV_STUB_SDK macosx)
 endif()
 
 if(GTAV_GAME_DLL)
@@ -135,7 +149,7 @@ if(GTAV_GAME_DLL)
         find_program(GTAV_LLVM_NM NAMES llvm-nm nm REQUIRED)
         get_filename_component(GTAV_LLVM_BIN "${GTAV_LLVM_NM}" DIRECTORY)
         add_custom_command(TARGET gtav PRE_LINK
-            COMMAND ${CMAKE_COMMAND} -E env GTAV_STUB_SDK=$<IF:$<BOOL:${GTAV_IOS}>,iphoneos,macosx>
+            COMMAND ${CMAKE_COMMAND} -E env GTAV_STUB_SDK=${GTAV_STUB_SDK}
                     ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/../tools/game_dll/gen_interface.py
                     ${GTAV_LLVM_BIN} ${CMAKE_BINARY_DIR}/CMakeFiles/gtav.dir ${GTAV_INTERFACE_DIR}
                     $<TARGET_FILE:rex::runtime> ${CMAKE_CXX_COMPILER}

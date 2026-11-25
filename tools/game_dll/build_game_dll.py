@@ -84,6 +84,11 @@ def main():
                          "and librexruntime.so in LIB_DIR")
     ap.add_argument("--ios", action="store_true",
                     help="macOS host: build gtav_game.dylib for the iOS app (arm64-apple-ios17, A14+)")
+    ap.add_argument("--visionos", action="store_true",
+                    help="macOS host with Xcode: build gtav_game.dylib for the visionOS app "
+                         "(arm64-apple-xros2, M2+), linked against the visionOS SDK's libSystem")
+    ap.add_argument("--simulator", action="store_true",
+                    help="with --visionos: for the visionOS simulator on this Mac")
     a = ap.parse_args()
     android = a.android is not None
 
@@ -98,6 +103,9 @@ def main():
         if a.ios:
             cxxflags = [f for f in cxxflags if not f.startswith(("--target=", "-mcpu="))] + \
                 ["--target=arm64-apple-ios17.0", "-mcpu=apple-a14"]
+        elif a.visionos:
+            cxxflags = [f for f in cxxflags if not f.startswith(("--target=", "-mcpu="))] + \
+                ["--target=arm64-apple-xros2.0" + ("-simulator" if a.simulator else ""), "-mcpu=apple-m2"]
     elif LINUX:
         clang = find_tool(a.llvm_bin, ["clang++", "clang++-20", "clang++-19"])
         lld = find_tool(a.llvm_bin, ["ld.lld", "ld.lld-20", "ld.lld-19"])
@@ -175,6 +183,14 @@ def main():
             i = ldflags.index("-platform_version")
             ldflags[i + 1:i + 4] = ["ios", "17.0", "17.0"]
             tbd = os.path.join(ROOT, "tools", "game_dll", "libSystem_ios.tbd")
+        elif a.visionos:
+            ldflags = [x for x in LDFLAGS_MACOS]
+            i = ldflags.index("-platform_version")
+            ldflags[i + 1:i + 4] = ["xros-simulator" if a.simulator else "xros", "2.0", "2.0"]
+            sdk = subprocess.run(["xcrun", "--sdk", "xrsimulator" if a.simulator else "xros",
+                                  "--show-sdk-path"], capture_output=True,
+                                 text=True, check=True).stdout.strip()
+            tbd = os.path.join(sdk, "usr", "lib", "libSystem.tbd")
         subprocess.run([lld] + ldflags +
                        ["-exported_symbols_list", os.path.join(a.interface, "gtav_game.exports"),
                         tbd, a.runtime,

@@ -34,7 +34,8 @@ enum class Convert { kNone, k565, k1555, k4444, k2_10_10_10, kBC1, kBC2, kBC3, k
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+// visionOS runs on M-series GPUs, which sample BC formats (MTLDevice supportsBCTextureCompression).
+#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_VISION
 constexpr bool kDecodeBC = true;
 #else
 constexpr bool kDecodeBC = false;

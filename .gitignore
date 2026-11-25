@@ -23,3 +23,5 @@ tools/scripttools/bk
 tools/scripttools/scan
 rexglue-sdk/
 .DS_Store
+# Personal Apple signing/device settings for tools/visionos (team ID, bundle ID, device UDID)
+tools/visionos/local.env

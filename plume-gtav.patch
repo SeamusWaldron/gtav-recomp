@@ -1,8 +1,8 @@
 diff --git a/plume_apple.mm b/plume_apple.mm
-index 1384fe9..3ff79fe 100644
+index 1384fe9..395ba18 100644
 --- a/plume_apple.mm
 +++ b/plume_apple.mm
-@@ -7,6 +7,79 @@
+@@ -7,6 +7,87 @@
  
  #include "plume_apple.h"
  
@@ -23,13 +23,21 @@ index 1384fe9..3ff79fe 100644
 +    static void plumeReadWindow(void* handle, CocoaWindowAttributes* out, int* refresh) {
 +        UIWindow *window = (__bridge UIWindow *)handle;
 +        CGRect bounds = window.bounds;
++#if TARGET_OS_VISION
++        // visionOS has no UIScreen: the window's traits carry the scale; the displays run at 90 Hz
++        // (96/100 Hz modes exist, but the compositor paces us, not this value).
++        CGFloat scale = window.traitCollection.displayScale;
++        if (scale <= 0) scale = 2.0;
++        *refresh = 90;
++#else
 +        UIScreen *screen = window.screen ? window.screen : [UIScreen mainScreen];
 +        CGFloat scale = screen.nativeScale;
++        *refresh = (int)screen.maximumFramesPerSecond;
++#endif
 +        out->x = 0;
 +        out->y = 0;
 +        out->width = (int)round(bounds.size.width * scale);
 +        out->height = (int)round(bounds.size.height * scale);
-+        *refresh = (int)screen.maximumFramesPerSecond;
 +    }
 +
 +    CocoaWindow::CocoaWindow(void* window)
@@ -82,7 +90,7 @@ index 1384fe9..3ff79fe 100644
  #import <AppKit/AppKit.h>
  #import <Foundation/Foundation.h>
  #import <IOKit/IOKitLib.h>
-@@ -176,3 +249,5 @@ namespace plume {
+@@ -176,3 +257,5 @@ namespace plume {
          }
      }
  }

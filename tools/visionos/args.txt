@@ -1,0 +1,14 @@
+# GTA V visionOS dev launch arguments (paths relative to the app's Documents). The data folders
+# are the Mac install's data/game, data/update and data/user, copied with tools/visionos/push_data.sh
+# or streamed from the Mac by the data bridge (make_app.sh GTAV_BRIDGE=1 appends --bridge_url).
+--game_data_root=data/game
+--user_data_root=data/user
+--update_data_root=data/update
+--gtav_native_spirv_dir=spirv
+--gpu_plugin=xenos --headless=true
+--gtav_native=on --gpu_skip_rendering=true --gpu_skip_rendering_lag_ms=6
+--vsync=false --gtav_native_vsync=true --gtav_fps_limit=60
+--audio_device_frames=256
+--log_level=info --log_file=logs/gtav.log --log_max_file_size_mb=32 --log_max_files=2
+--window_presenter=false
+--gtav_native_fetch_resolves=false

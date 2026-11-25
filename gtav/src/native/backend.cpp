@@ -53,16 +53,25 @@
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
-#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+// GTAV_MOBILE: phone GPUs (Adreno, iPhone): constants in uniform buffers (the phone SPIR-V variant),
+// draw-clear load ops, a 0.75 render scale. visionOS is not: its M-series GPU takes the desktop
+// path and the Mac's SPIR-V as they are. GTAV_JETSAM: Apple's embedded systems (iPhone and
+// visionOS) kill an app over its memory limit, so the caches get budgets and shrink when it is low.
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_VISION)
 #define GTAV_MOBILE 1
 #else
 #define GTAV_MOBILE 0
+#endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define GTAV_JETSAM 1
+#else
+#define GTAV_JETSAM 0
 #endif
 #ifdef __ANDROID__
 #include <sched.h>
 #include <unistd.h>
 #endif
-#if GTAV_MOBILE && defined(__APPLE__)
+#if GTAV_JETSAM
 #include <os/proc.h>
 #endif
 #include <vector>
@@ -144,7 +153,7 @@ REXCVAR_DEFINE_INT32(gtav_native_texture_budget_mb, 1024, "GTAV",
                      "Decoded texture cache budget: textures idle for 2 s are released above it (unified memory)");
 // iPhone: the vertex/index buffer cache had no limit and reached 18,000 buffers (140 MB of Metal
 // memory plus driver objects) within minutes of driving; the app was killed at ~2.2 GB.
-#if GTAV_MOBILE
+#if GTAV_MOBILE || GTAV_JETSAM
 #define GTAV_BUFFER_BUDGET_DEFAULT 96
 #define GTAV_LOW_MEMORY_DEFAULT 600
 #else
@@ -2293,7 +2302,7 @@ struct Backend::Impl {
     if (frame % 60) return;
     // Low memory (iOS jetsam headroom): half the budgets, and anything idle for 30 frames may go.
     bool low_memory = false;
-#if GTAV_MOBILE && defined(__APPLE__)
+#if GTAV_JETSAM
     if (const int32_t low = REXCVAR_GET(gtav_native_low_memory_mb); low > 0)
       low_memory = os_proc_available_memory() < (uint64_t(low) << 20);
 #endif
