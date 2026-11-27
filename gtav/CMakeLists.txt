@@ -467,5 +467,5 @@ if(GTAV_VISIONOS AND GTAV_IMMERSIVE)
     target_link_directories(gtav PRIVATE "${GTAV_XROS_SDK_PATH}/usr/lib/swift"
                             "${GTAV_SWIFT_BIN}/../lib/swift/xros")
     target_link_libraries(gtav PRIVATE "-framework SwiftUI" "-framework CompositorServices"
-                          "-framework ARKit" "-framework QuartzCore")
+                          "-framework ARKit" "-framework QuartzCore" "-framework GameController")
 endif()

@@ -18,6 +18,7 @@
 
 #include <rex/cvar.h>
 #include <rex/kernel.h>
+#include "safe_read.h"
 #include <rex/logging.h>
 #include <rex/system.h>
 
@@ -279,6 +280,9 @@ REXCVAR_DEFINE_BOOL(gtav_native_async_pipelines, true, "GTAV",
 REXCVAR_DECLARE(std::string, gtav_native);
 REXCVAR_DEFINE_INT32(gtav_native_dump_frame, 0, "GTAV",
                      "Dump every resolve of this guest frame to logs/native_dump/ as PNG");
+REXCVAR_DEFINE_BOOL(gtav_native_dump_memory, false, "GTAV",
+                    "Frame dumps: also save the guest's 512 MB of physical memory (physical.bin; "
+                    "unreadable pages as zeros), for finding game structures offline");
 REXCVAR_DEFINE_INT32(gtav_native_dump_frames, 1, "GTAV",
                      "Frame dumps: one request (F9) dumps this many consecutive frames (~350 MB each)");
 REXCVAR_DEFINE_BOOL(gtav_native_scissor, true, "GTAV",
@@ -6262,6 +6266,23 @@ void Backend::WriteDump() {
   if (FILE* draws = std::fopen((dir + "/draws.bin").c_str(), "wb")) {
     std::fwrite(s.dump_draws.data(), 4, s.dump_draws.size(), draws);
     std::fclose(draws);
+  }
+  if (REXCVAR_GET(gtav_native_dump_memory)) {
+    if (FILE* mem = std::fopen((dir + "/physical.bin").c_str(), "wb")) {
+      constexpr uint32_t kChunk = 64 * 1024, kPhysical = 512u << 20;
+      std::vector<uint8_t> chunk(kChunk);
+      uint32_t unreadable = 0;
+      for (uint32_t a = 0; a < kPhysical; a += kChunk) {
+        if (!SafeReadMemory(chunk.data(), REX_KERNEL_MEMORY()->TranslatePhysical(a), kChunk)) {
+          std::fill(chunk.begin(), chunk.end(), 0);
+          unreadable++;
+        }
+        std::fwrite(chunk.data(), 1, kChunk, mem);
+      }
+      std::fclose(mem);
+      REXLOG_INFO("[native] dumped physical memory ({} of {} 64 KB chunks unreadable)", unreadable,
+                  kPhysical / kChunk);
+    }
   }
   if (FILE* log = std::fopen((dir + "/commands.txt").c_str(), "w")) {
     std::fwrite(s.dump_log.data(), 1, s.dump_log.size(), log);

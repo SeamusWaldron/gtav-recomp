@@ -4,9 +4,12 @@
 // the newest game frame, for each eye, onto a 16:9 screen fixed in the room: 3.2 m wide, 3 m in
 // front of where the player looked when the space opened, at eye height. The game renders at its
 // own rate; the newest frame it published is shown again until the next one arrives.
+// Recentre: hold both sticks in (L3 + R3) for 0.75 s and the screen moves to where the player looks.
 // Compiled with ARC.
 #include "immersive.h"
 
+#import <GameController/GameController.h>
+#import <QuartzCore/QuartzCore.h>
 #import <Metal/Metal.h>
 #include <ARKit/ARKit.h>
 #include <CompositorServices/CompositorServices.h>
@@ -23,6 +26,7 @@ namespace {
 constexpr float kScreenDistance = 3.0f;  // metres in front of the player
 constexpr float kScreenHalfWidth = 1.6f;
 constexpr float kScreenHalfHeight = 0.9f;
+constexpr double kRecentreHoldSeconds = 0.75;
 
 // The game frame is gamma-encoded in a UNORM texture and the drawable is sRGB: decode on read so
 // the compositor's sRGB write encodes it back once. No game frame yet: a dim checkerboard.
@@ -85,6 +89,15 @@ simd_float4x4 PlaceScreen(simd_float4x4 head) {
   simd_float3 center = position + forward * kScreenDistance;
   return simd_matrix(simd_make_float4(x, 0), simd_make_float4(y, 0), simd_make_float4(z, 0),
                      simd_make_float4(center, 1));
+}
+
+// Both sticks pressed on any connected controller (read directly, beside SDL's own reading).
+bool RecentreButtonsHeld() {
+  for (GCController* controller in GCController.controllers) {
+    GCExtendedGamepad* pad = controller.extendedGamepad;
+    if (pad && pad.leftThumbstickButton.isPressed && pad.rightThumbstickButton.isPressed) return true;
+  }
+  return false;
 }
 
 std::vector<cp_drawable_t> Drawables(cp_frame_t frame) {
@@ -167,6 +180,8 @@ extern "C" void gtav_immersive_run(cp_layer_renderer_t layer) {
                                           simd_make_float4(0, kScreenHalfHeight, 0, 0),
                                           simd_make_float4(0, 0, 1, 0), simd_make_float4(0, 0, 0, 1));
   uint64_t frames = 0, tracked = 0;
+  CFTimeInterval recentre_since = 0;  // when L3 + R3 went down; 0 while not held
+  bool recentre_armed = true;         // one recentre per press
 
   for (bool running = true; running;) {
     @autoreleasepool {
@@ -185,6 +200,17 @@ extern "C" void gtav_immersive_run(cp_layer_renderer_t layer) {
       cp_frame_timing_t timing = cp_frame_predict_timing(frame);
       if (!timing) continue;
       cp_frame_start_update(frame);
+      if (RecentreButtonsHeld()) {
+        CFTimeInterval now = CACurrentMediaTime();
+        if (!recentre_since) recentre_since = now;
+        if (recentre_armed && now - recentre_since >= kRecentreHoldSeconds) {
+          placed = false;  // placed again from the next tracked head pose
+          recentre_armed = false;
+        }
+      } else {
+        recentre_since = 0;
+        recentre_armed = true;
+      }
       cp_frame_end_update(frame);
       cp_time_wait_until(cp_frame_timing_get_optimal_input_time(timing));
       cp_frame_start_submission(frame);
@@ -209,7 +235,8 @@ extern "C" void gtav_immersive_run(cp_layer_renderer_t layer) {
             screen = PlaceScreen(head);
             placed = true;
             const float height = screen.columns[3].y;
-            REXLOG_INFO("[immersive] screen placed {:.2f} m ahead at height {:.2f} m", kScreenDistance, height);
+            REXLOG_INFO("[immersive] screen placed {:.2f} m ahead at height {:.2f} m{}", kScreenDistance, height,
+                        frames ? " (recentred)" : "");
           }
         }
         for (size_t v = 0, n = cp_drawable_get_view_count(drawable); v < n; ++v) {

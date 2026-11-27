@@ -91,6 +91,8 @@ REXCVAR_DEFINE_BOOL(gtav_native_hidden, false, "GTAV",
                     "Native renderer: keep every game window hidden (unattended test runs)");
 REXCVAR_DEFINE_STRING(gtav_native_device, "NVIDIA", "GTAV",
                       "Substring of the Vulkan device name the native renderer prefers");
+REXCVAR_DEFINE_INT32(gtav_native_dump_after_load, 0, "GTAV",
+                     "Frame dump (as F9) this many guest frames after the first load finished (0: off)");
 REXCVAR_DEFINE_STRING(gtav_native_spirv_dir, "", "GTAV",
                       "Directory of precompiled shaders (<vs|ps>_<hash>.spv); default derive/native/census1/spirv");
 
@@ -1405,6 +1407,8 @@ class Renderer {
         load_reported_ = true;
         REXLOG_INFO("[native] first load finished (guest frame {})", frame.index);
         rex::filesystem::bridge::SetLoaded();
+        if (int32_t after = REXCVAR_GET(gtav_native_dump_after_load); after > 0)
+          native_dump_at_ = frame.index + uint64_t(after);
       }
     }
 #endif

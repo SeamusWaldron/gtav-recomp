@@ -45,6 +45,7 @@ struct GTAVApp: App {
     WindowGroup(id: "launcher") {
       LauncherView()
     }
+    .windowStyle(.plain)
     .defaultSize(width: 560, height: 280)
 
     ImmersiveSpace(id: "game") {
@@ -65,15 +66,18 @@ struct LauncherView: View {
   @State private var status = "Opening the immersive space..."
   @State private var open = false
 
+  // The window cannot close while the game runs (SDL's hidden game window lives in its scene), so
+  // once the space is open it turns invisible and lets input through.
   var body: some View {
     VStack(spacing: 14) {
       Text("GTA V").font(.largeTitle).bold()
       Text(status).foregroundStyle(.secondary)
-      if !open {
-        Button("Enter") { Task { await enter() } }
-      }
+      Button("Enter") { Task { await enter() } }
     }
     .padding(36)
+    .glassBackgroundEffect()
+    .opacity(open ? 0 : 1)
+    .allowsHitTesting(!open)
     .onAppear {
       GameStarter.shared.startOnce()
       Task { await enter() }
