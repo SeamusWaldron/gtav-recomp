@@ -9,6 +9,9 @@
 
 #include <imgui.h>
 #include <rex/cvar.h>
+#if !defined(_WIN32)
+#include <rex/filesystem/bridge.h>
+#endif
 #include <rex/logging.h>
 
 #include <algorithm>
@@ -121,6 +124,88 @@ void EnsureContext(uint32_t h) {
   style.ScaleAllSizes(g_scale);
   if (previous) ImGui::SetCurrentContext(previous);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Streaming panel: while the data bridge (docs/BRIDGE.md) is loading game data from the Mac, a
+// panel at the top says so, how fast, and how long is left. After the first load it shows only
+// when the game stalls on the Mac for more than half a second.
+
+#if !defined(_WIN32)
+namespace bridge = rex::filesystem::bridge;
+
+std::string Duration(double s) {
+  if (s < 60) return std::to_string(int(s + 0.5)) + " s";
+  int m = int(s / 60), r = int(s - m * 60.0);
+  return std::to_string(m) + " min " + (r < 10 ? "0" : "") + std::to_string(r) + " s";
+}
+
+std::string TimeLeft(double s) {
+  if (s < 10) return "a few seconds";
+  if (s < 60) return "about " + std::to_string((int(s) + 9) / 10 * 10) + " s";
+  int m = int(s / 60 + 0.5);
+  return "about " + std::to_string(std::max(1, m)) + (m == 1 ? " minute" : " minutes");
+}
+
+double g_panel_until = 0;  // elapsed time until which the stall panel stays up (hysteresis)
+double g_loaded_at = -1;   // when the first load finished, for a short "done" message
+
+// Decides whether the panel shows this frame (status sampled once per frame).
+bool StreamPanelWanted(const bridge::Status& st) {
+  if (!st.active) return false;
+  if (!st.loading && g_loaded_at < 0) g_loaded_at = st.elapsed;
+  if (st.loading) {
+    // Fetching, about to, or cut off from the Mac: worth saying. A fully cached load stays quiet.
+    return st.seconds_since_fetch < 3 || st.waiting_seconds > 0 || st.plan_missing > 0 ||
+           !st.online || st.errors > 0;
+  }
+  if (st.waiting_seconds > 0.5) g_panel_until = st.elapsed + 1.5;
+  return st.elapsed < g_panel_until || st.elapsed - g_loaded_at < 4;
+}
+
+void DrawStreamPanel(const bridge::Status& st, float w) {
+  const float pw = std::min(w - 32.0f * g_scale, 520.0f * g_scale);
+  ImGui::SetNextWindowPos(ImVec2((w - pw) * 0.5f, 16.0f * g_scale), ImGuiCond_Always);
+  ImGui::SetNextWindowSize(ImVec2(pw, 0), ImGuiCond_Always);
+  ImGui::SetNextWindowBgAlpha(0.78f);
+  ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav |
+                           ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                           ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing |
+                           ImGuiWindowFlags_AlwaysAutoResize;
+  const ImVec4 dim(0.70f, 0.70f, 0.70f, 1.0f), warn(1.0f, 0.72f, 0.30f, 1.0f),
+      bad(1.0f, 0.42f, 0.38f, 1.0f), good(0.55f, 0.85f, 0.55f, 1.0f);
+  if (ImGui::Begin("##bridge_panel", nullptr, flags)) {
+    const bool done = !st.loading && st.waiting_seconds <= 0.5 && st.elapsed >= g_panel_until;
+    if (done) {
+      ImGui::TextColored(good, "Game data loaded");
+      ImGui::TextColored(dim, "%.1f GB from your Mac in %s", st.fetched / 1e9, Duration(g_loaded_at).c_str());
+    } else {
+      ImGui::TextUnformatted(st.loading ? "Loading game data from your Mac" : "Waiting for data from your Mac");
+      if (st.loading && st.have_plan && st.plan_missing_at_start > 0) {
+        float frac = 1.0f - float(double(st.plan_missing) / double(st.plan_missing_at_start));
+        std::string label = st.plan_missing == 0 ? std::string("all here, finishing up")
+                            : st.eta >= 0       ? TimeLeft(st.eta) + " left"
+                                                : std::string("waiting for the Mac");
+        ImGui::ProgressBar(std::clamp(frac, 0.0f, 1.0f), ImVec2(-1, 0), label.c_str());
+        if (!st.plan_complete)
+          ImGui::TextColored(dim, "The last launch stopped before loading finished: this may run longer.");
+      } else if (st.loading) {
+        ImGui::TextColored(dim, "First launch: no time estimate yet. Later launches show one,");
+        ImGui::TextColored(dim, "and load faster, since what you load now stays on the headset.");
+      }
+      ImGui::TextColored(dim, "%.2f GB fetched  |  %.1f MB/s  |  %s", st.fetched / 1e9, st.rate / 1e6,
+                         Duration(st.elapsed).c_str());
+      if (st.waiting_seconds > 2)
+        ImGui::TextColored(warn, "The game has waited %.0f s for the Mac", st.waiting_seconds);
+    }
+    if (!st.online)
+      ImGui::TextColored(bad, "Mac not reachable: only data already on the headset will load.");
+    else if (st.errors)
+      ImGui::TextColored(bad, "%llu fetches failed. Is the bridge still running on the Mac?",
+                         static_cast<unsigned long long>(st.errors));
+  }
+  ImGui::End();
+}
+#endif
 
 void Push(const Input& in) {
   if (!g_open) return;
@@ -269,7 +354,13 @@ void LoadSettings() {
 
 ImDrawData* Frame(uint32_t w, uint32_t h, uint32_t fps, double frame_ms) {
   const bool touch_overlay = touch::Visible();
-  if (!g_open && !touch_overlay) return nullptr;
+#if !defined(_WIN32)
+  const bridge::Status stream = bridge::GetStatus();
+  const bool stream_panel = StreamPanelWanted(stream);
+#else
+  const bool stream_panel = false;
+#endif
+  if (!g_open && !touch_overlay && !stream_panel) return nullptr;
   EnsureContext(h);
   ImGuiContext* previous = ImGui::GetCurrentContext();
   ImGui::SetCurrentContext(g_context);
@@ -294,6 +385,9 @@ ImDrawData* Frame(uint32_t w, uint32_t h, uint32_t fps, double frame_ms) {
     io.Fonts->GetTexDataAsRGBA32(&pixels, &fw, &fh);
   }
   ImGui::NewFrame();
+#if !defined(_WIN32)
+  if (stream_panel) DrawStreamPanel(stream, float(w));
+#endif
   if (g_open) Build(fps, frame_ms);
   if (touch_overlay) touch::Draw(ImGui::GetForegroundDrawList(), float(w), float(h));
   ImGui::Render();

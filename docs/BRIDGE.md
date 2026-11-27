@@ -84,6 +84,31 @@ time it is read.
 - Recency is kept in memory only. After a restart every block counts as old, so the first trim
   falls on blocks this run has not read yet.
 
+## Loading panel and load list
+
+While data is coming from the Mac, the native renderer draws a panel at the top of the screen
+(`gtav/src/native/menu.cpp`, from `bridge::GetStatus()`). It shows the GB fetched, the rate and
+the time since launch, and says when the game has waited on the Mac for more than 2 s, when the
+Mac was unreachable at start-up, and when fetches failed. A load that only reads cached data
+shows no panel. After the first load, the panel comes back only when the game stalls on the Mac
+for more than half a second.
+
+The time left comes from the **load list**, `data/.bridge/load.txt`. During the first load the
+client records every block the game reads, in the order it first reads it. The list holds file
+labels and block numbers only, never data. The load counts as over once the renderer has drawn
+at least 300 draws a frame for 120 frames in a row; loading screens draw 6 to 14. On the next
+launch:
+
+- the time left is the listed data not yet on the headset, divided by the current rate (or, until
+  data flows, the rate the earlier launch saw);
+- two threads fetch the listed blocks ahead of the game, in the order it read them, so the game
+  waits less.
+
+The first launch has no list, so its panel says so and shows no estimate. A launch stopped
+before its load finished still saves its list, marked unfinished. The next launch merges into it
+and warns that the estimate may run short. A finished list is only ever replaced by another
+finished one.
+
 ## Network
 
 - The client resolves the name with `getaddrinfo`. Apple's resolver handles mDNS, so
@@ -131,6 +156,21 @@ headset can't reach it.
 - 2026-11-25, Mac, `--bridge_cache_max_gb=1`, starting from the 1.6 GB cache above. The cache was
   trimmed to about 1 GB at start-up and held between 0.97 and 1.02 GB while loading (934 MB on
   disk). The game kept rendering, with no errors.
+
+- 2026-11-26, Vision Pro on home Wi-Fi, Mac serving from the USB drive. A first launch (old
+  build, no panel) ran at 7 to 10 MB/s, with misses waiting about 500 ms; it was stopped at the
+  loading screen with 1.65 GB cached. The second launch (loading panel and load list) started
+  with that cache, ran at 17 to 24 MB/s with misses waiting 210 to 320 ms, and reached the game
+  world 138 s after launch (guest frame 7421). It had fetched another 2.3 GB. It saved a
+  finished load list of 1280 blocks. The panel showed during the load. The only error was a
+  `gamecache:` lookup that a full local copy on the Mac logs too. The screen stayed black, with
+  audio playing: the app had been built without `GTAV_SPIRV`, so all of its roughly 1000 draws per
+  frame were skipped. The shaders are not game data the bridge serves: they are translated on the
+  Mac into `data/spirv` and bundled into the app. `make_app.sh` now bundles them by default.
+  Even bundled, they were hidden by an empty `Documents/spirv` left by an older args.txt; the
+  app now skips an empty one (`gtav/src/native/paths.h`). With that fixed, the next launch found
+  everything it needed cached. It preloaded 3666 shaders, loaded in about 25 s and is playable
+  with a DualShock 4 paired to the headset.
 
 ## Test plan
 

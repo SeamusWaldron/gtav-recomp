@@ -168,10 +168,10 @@ index d876846..549bdf8 100644
  
 diff --git a/include/rex/filesystem/bridge.h b/include/rex/filesystem/bridge.h
 new file mode 100644
-index 0000000..1e10ea6
+index 0000000..2fa24e5
 --- /dev/null
 +++ b/include/rex/filesystem/bridge.h
-@@ -0,0 +1,49 @@
+@@ -0,0 +1,73 @@
 +/**
 + * @file        filesystem/bridge.h
 + * @brief       Streams host game data from a bridge server and caches it in place
@@ -219,6 +219,30 @@ index 0000000..1e10ea6
 +// Before a normal open of @p path: completes a streamed file (unless @p truncate), and detaches
 +// it when @p write so the local copy owns it from then on. False if the data could not be fetched.
 +bool PrepareOpen(const std::filesystem::path& path, bool write, bool truncate);
++
++// What the on-screen loading panel shows. Cheap to call every frame (refreshed every 250 ms).
++struct Status {
++  bool active = false;   // the bridge is on
++  bool online = false;   // the Mac answered at start-up
++  bool loading = false;  // the game's first load has not finished (see SetLoaded)
++  // The game has been blocked on a fetch for `waiting_seconds` (0 when it is not waiting).
++  double waiting_seconds = 0;
++  double rate = 0;         // bytes/s over the last few seconds
++  double seconds_since_fetch = 1e9;
++  uint64_t fetched = 0;    // bytes fetched this run
++  uint64_t errors = 0;
++  double elapsed = 0;      // seconds since Start
++  // The load list recorded by an earlier launch: what this load is expected to read.
++  bool have_plan = false;
++  bool plan_complete = false;    // that launch reached the end of its load
++  uint64_t plan_missing = 0;     // bytes of it not on this device yet
++  uint64_t plan_missing_at_start = 0;
++  double eta = -1;               // seconds until plan_missing is fetched; -1 unknown
++};
++Status GetStatus();
++
++// The game's first load is over (the renderer saw sustained real frames). Saves the load list.
++void SetLoaded();
 +
 +}  // namespace rex::filesystem::bridge
 diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
@@ -1464,10 +1488,10 @@ index 4fe1ca6..c5a4199 100644
    // Thread fibers are destroyed from the owning thread itself.
 diff --git a/src/core/filesystem_bridge.cpp b/src/core/filesystem_bridge.cpp
 new file mode 100644
-index 0000000..3bd8d6c
+index 0000000..3a3fcfa
 --- /dev/null
 +++ b/src/core/filesystem_bridge.cpp
-@@ -0,0 +1,954 @@
+@@ -0,0 +1,1180 @@
 +/**
 + * @file        core/filesystem_bridge.cpp
 + * @brief       Bridge client: on-demand block streaming of host game data (see bridge.h and
@@ -1483,6 +1507,7 @@ index 0000000..3bd8d6c
 +#include <cerrno>
 +#include <chrono>
 +#include <condition_variable>
++#include <deque>
 +#include <cstring>
 +#include <fstream>
 +#include <mutex>
@@ -1863,6 +1888,27 @@ index 0000000..3bd8d6c
 +uint64_t g_cap = 0;                      // cache budget in bytes; 0 = no limit
 +std::atomic<uint64_t> g_cached{0};       // bytes of cached blocks in streamed files
 +std::atomic<uint32_t> g_tick{1};         // read counter: per-block recency for eviction
++std::atomic<bool> g_online{false};
++std::atomic<bool> g_loading{true};       // until SetLoaded: reads are recorded in the load list
++std::atomic<int64_t> g_wait_since{0};    // steady ns when the oldest current miss began; 0 = none
++std::atomic<int64_t> g_last_fetch{0};    // steady ns of the last completed fetch
++std::chrono::steady_clock::time_point g_started;
++
++int64_t NowNs() {
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++
++// A foreground wait on the network (the game is blocked). Tracks when the current stall began.
++struct ForegroundWait {
++  ForegroundWait() {
++    if (g_foreground.fetch_add(1) == 0) g_wait_since = NowNs();
++  }
++  ~ForegroundWait() {
++    if (g_foreground.fetch_sub(1) == 1) g_wait_since = 0;
++  }
++};
 +
 +struct StreamFile {
 +  std::string label;   // root/rel, for logs
@@ -1886,8 +1932,15 @@ index 0000000..3bd8d6c
 +  // Shared by readers from Ensure through pread; exclusive while a block is evicted.
 +  std::shared_mutex evict_mutex;
 +  std::unique_ptr<std::atomic<uint32_t>[]> access;  // last-read tick per block
++  std::unique_ptr<std::atomic<uint8_t>[]> touched;  // read during this run's load
++  std::vector<uint8_t> planned;                     // in the earlier launch's load list
 +
 +  bool Has(uint64_t b) const { return bits[b >> 3] & (1u << (b & 7)); }
++  bool HasLocked(uint64_t b) {
++    std::lock_guard<std::mutex> lock(mutex);
++    return detached || Has(b);
++  }
++  void Touch(uint64_t b0, uint64_t b1);  // records first reads in the load list
 +  uint64_t BlockBytes(uint64_t b) const { return std::min(size - b * kBlock, kBlock); }
 +  // Caller holds mutex (or the file is not shared yet).
 +  uint64_t CachedBytes() const {
@@ -1952,6 +2005,7 @@ index 0000000..3bd8d6c
 +    }
 +    g_stats.bytes += len;
 +    g_stats.requests++;
++    g_last_fetch = NowNs();
 +    return true;
 +  }
 +
@@ -1988,6 +2042,7 @@ index 0000000..3bd8d6c
 +      uint32_t tick = g_tick.fetch_add(1, std::memory_order_relaxed);
 +      for (uint64_t b = b0; b <= b1; ++b) access[b].store(tick, std::memory_order_relaxed);
 +    }
++    if (g_loading.load(std::memory_order_relaxed)) Touch(b0, b1);
 +    if (!complete) {
 +      bool missing = false;
 +      {
@@ -1996,13 +2051,15 @@ index 0000000..3bd8d6c
 +      }
 +      if (missing) {
 +        g_stats.misses++;
-+        g_foreground++;
-+        auto t0 = std::chrono::steady_clock::now();
-+        bool ok = Ensure(b0, b1, kReadAheadBlocks);
-+        g_stats.wait_us += std::chrono::duration_cast<std::chrono::microseconds>(
-+                               std::chrono::steady_clock::now() - t0)
-+                               .count();
-+        g_foreground--;
++        bool ok;
++        {
++          ForegroundWait waiting;
++          auto t0 = std::chrono::steady_clock::now();
++          ok = Ensure(b0, b1, kReadAheadBlocks);
++          g_stats.wait_us += std::chrono::duration_cast<std::chrono::microseconds>(
++                                 std::chrono::steady_clock::now() - t0)
++                                 .count();
++        }
 +        if (!ok) {
 +          REXFS_ERROR("bridge: could not fetch {} @{:#x}+{:#x} (is the Mac's bridge running?)",
 +                      label, offset, n);
@@ -2050,6 +2107,129 @@ index 0000000..3bd8d6c
 +std::unordered_map<std::string, std::shared_ptr<StreamFile>> g_files;
 +std::vector<std::shared_ptr<StreamFile>> g_order;  // by size, for prefetch
 +std::filesystem::path g_state;
++
++// ---------------------------------------------------------------------------------------------
++// Load list: the blocks the game read during its first load, in the order it first read them
++// (data/.bridge/load.txt). The next launch uses it to estimate the time left and to fetch ahead
++// of the game. Holds positions only, never data.
++
++struct BlockRef {
++  StreamFile* file;
++  uint64_t block;
++};
++std::mutex g_list_mutex;
++std::vector<BlockRef> g_touch_order;  // this run, first reads during the load
++std::atomic<bool> g_touch_dirty{false};
++std::vector<BlockRef> g_plan;         // the earlier launch's list (read-only after Start)
++bool g_plan_complete = false;
++double g_plan_rate = 0;               // bytes/s the earlier launch saw while loading
++uint64_t g_plan_missing_at_start = 0;
++
++void StreamFile::Touch(uint64_t b0, uint64_t b1) {
++  for (uint64_t b = b0; b <= b1; ++b) {
++    if (touched[b].load(std::memory_order_relaxed) || touched[b].exchange(1)) continue;
++    std::lock_guard<std::mutex> lock(g_list_mutex);
++    g_touch_order.push_back({this, b});
++    g_touch_dirty = true;
++  }
++}
++
++StreamFile* FindByLabel(const std::string& label) {
++  for (auto& f : g_order)
++    if (f->label == label) return f.get();
++  return nullptr;
++}
++
++void LoadPlan() {
++  std::ifstream in(g_state / "load.txt");
++  std::string line;
++  if (!in || !std::getline(in, line)) return;
++  std::istringstream head(line);
++  std::string magic;
++  int complete = 0;
++  head >> magic >> complete >> g_plan_rate;
++  if (magic != "GTBRLOAD1") return;
++  g_plan_complete = complete != 0;
++  while (std::getline(in, line)) {
++    auto t1 = line.find('\t'), t2 = line.rfind('\t');
++    if (t1 == std::string::npos || t2 == t1) continue;
++    StreamFile* f = FindByLabel(line.substr(t2 + 1));
++    if (!f) continue;  // owned locally now, or gone from the Mac
++    uint64_t b = std::strtoull(line.c_str(), nullptr, 10);
++    uint64_t n = std::strtoull(line.c_str() + t1 + 1, nullptr, 10);
++    for (uint64_t i = 0; i < n && b + i < f->nblocks; ++i) {
++      if (f->planned[b + i]) continue;
++      f->planned[b + i] = 1;
++      g_plan.push_back({f, b + i});
++    }
++  }
++}
++
++// Writes the list. A finished load replaces the old list; an unfinished one is merged into an
++// unfinished old list (so a load cut short twice still adds up), and never replaces a finished one.
++void SavePlan(bool complete) {
++  if (!complete && g_plan_complete) return;
++  std::vector<BlockRef> list;
++  {
++    std::lock_guard<std::mutex> lock(g_list_mutex);
++    list = g_touch_order;
++    g_touch_dirty = false;
++  }
++  if (!g_plan_complete) {
++    for (const auto& r : g_plan)
++      if (!r.file->touched[r.block].load(std::memory_order_relaxed)) list.push_back(r);
++  }
++  double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_started).count();
++  double rate = g_stats.bytes > (64u << 20) && secs > 0 ? g_stats.bytes / secs : g_plan_rate;
++  auto path = g_state / "load.txt", tmp = path;
++  tmp += ".tmp";
++  {
++    std::ofstream out(tmp);
++    out << "GTBRLOAD1 " << (complete ? 1 : 0) << ' ' << uint64_t(rate) << '\n';
++    // Runs of consecutive blocks of one file: "block\tcount\tlabel".
++    for (size_t i = 0; i < list.size();) {
++      size_t j = i + 1;
++      while (j < list.size() && list[j].file == list[i].file &&
++             list[j].block == list[j - 1].block + 1)
++        ++j;
++      out << list[i].block << '\t' << (j - i) << '\t' << list[i].file->label << '\n';
++      i = j;
++    }
++  }
++  std::error_code ec;
++  std::filesystem::rename(tmp, path, ec);
++  if (complete) {
++    REXFS_INFO("bridge: load finished; saved its list ({} blocks, {:.0f} MB fetched in {:.0f} s)",
++               list.size(), g_stats.bytes / 1e6, secs);
++  }
++}
++
++// Fetches the earlier launch's list ahead of the game, in the order it was read. Two of these run
++// so a fetch is always in flight while the other one's data is being written.
++std::atomic<size_t> g_plan_next{0};
++void PlanPrefetchLoop() {
++  for (;;) {
++    if (g_stop) return;
++    size_t i = g_plan_next.fetch_add(1);
++    if (i >= g_plan.size()) return;
++    const BlockRef& r = g_plan[i];
++    if (r.file->HasLocked(r.block)) continue;
++    if (g_cap && g_cached >= g_cap / 10 * 9) return;
++    // Take the run of consecutive planned blocks that follows, up to one request's worth.
++    uint64_t end = r.block;
++    size_t j = i + 1;
++    while (j < g_plan.size() && g_plan[j].file == r.file && g_plan[j].block == end + 1 &&
++           end - r.block + 1 < kMaxRunBlocks) {
++      ++end;
++      ++j;
++    }
++    if (j > i + 1) {
++      size_t expect = i + 1;
++      g_plan_next.compare_exchange_strong(expect, j);  // skip them unless another thread moved on
++    }
++    if (!r.file->Ensure(r.block, end, 0)) std::this_thread::sleep_for(std::chrono::seconds(2));
++  }
++}
 +
 +std::shared_ptr<StreamFile> Find(const std::filesystem::path& path) {
 +  if (!g_active.load(std::memory_order_acquire)) return nullptr;
@@ -2165,7 +2345,12 @@ index 0000000..3bd8d6c
 +  f->bits.assign((f->nblocks + 7) / 8, 0);
 +  f->inflight.assign(f->nblocks, 0);
 +  f->access = std::make_unique<std::atomic<uint32_t>[]>(std::max<uint64_t>(f->nblocks, 1));
-+  for (uint64_t b = 0; b < f->nblocks; ++b) f->access[b].store(0, std::memory_order_relaxed);
++  f->touched = std::make_unique<std::atomic<uint8_t>[]>(std::max<uint64_t>(f->nblocks, 1));
++  for (uint64_t b = 0; b < f->nblocks; ++b) {
++    f->access[b].store(0, std::memory_order_relaxed);
++    f->touched[b].store(0, std::memory_order_relaxed);
++  }
++  f->planned.assign(f->nblocks, 0);
 +
 +  std::filesystem::create_directories(local.parent_path(), ec);
 +  std::filesystem::create_directories(map_path.parent_path(), ec);
@@ -2255,6 +2440,8 @@ index 0000000..3bd8d6c
 +  uint64_t last_bytes = 0, last_misses = 0, last_wait = 0;
 +  while (!g_stop) {
 +    for (int i = 0; i < 100 && !g_stop; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
++    // An unfinished load's list is kept too, so stopping the app mid-load still teaches the next one.
++    if (g_loading && g_touch_dirty) SavePlan(false);
 +    uint64_t bytes = g_stats.bytes, misses = g_stats.misses, wait = g_stats.wait_us;
 +    if (bytes == last_bytes && misses == last_misses) continue;
 +    uint64_t cached = 0, total = 0, done = 0;
@@ -2280,6 +2467,7 @@ index 0000000..3bd8d6c
 +
 +bool Start(const Options& options) {
 +  if (g_active) return true;
++  g_started = std::chrono::steady_clock::now();
 +  g_cap = options.cache_max_bytes;
 +  if (options.roots.empty() || !g_client.Init(options.url)) {
 +    REXFS_ERROR("bridge: bad url '{}'", options.url);
@@ -2356,6 +2544,7 @@ index 0000000..3bd8d6c
 +  std::sort(g_order.begin(), g_order.end(),
 +            [](const auto& a, const auto& b) { return a->size < b->size; });
 +
++  g_online = online;
 +  if (online) {
 +    for (auto& f : small) {
 +      if (!f->EnsureAll()) REXFS_ERROR("bridge: could not fetch {}", f->label);
@@ -2372,8 +2561,20 @@ index 0000000..3bd8d6c
 +      entries.size(), remote_bytes / 1e6, g_order.size(), done, g_order.size(), cached / 1e6,
 +      local_owned, g_state.string());
 +
++  LoadPlan();
++  for (const auto& r : g_plan)
++    if (!r.file->Has(r.block)) g_plan_missing_at_start += r.file->BlockBytes(r.block);
++  if (!g_plan.empty()) {
++    REXFS_INFO("bridge: load list from an earlier launch ({}): {} blocks, {:.0f} MB not here yet",
++               g_plan_complete ? "finished" : "unfinished", g_plan.size(), g_plan_missing_at_start / 1e6);
++  }
++
 +  g_active.store(true, std::memory_order_release);
 +  std::thread(ReportLoop).detach();
++  if (online && g_plan_missing_at_start) {
++    std::thread(PlanPrefetchLoop).detach();
++    std::thread(PlanPrefetchLoop).detach();
++  }
 +  if (g_cap) {
 +    REXFS_INFO("bridge: cache cap {:.1f} GB", g_cap / 1e9);
 +    std::thread(EvictLoop).detach();
@@ -2388,6 +2589,53 @@ index 0000000..3bd8d6c
 +
 +bool IsActive() {
 +  return g_active;
++}
++
++void SetLoaded() {
++  if (!g_active || !g_loading.exchange(false)) return;
++  SavePlan(true);
++}
++
++Status GetStatus() {
++  static std::mutex mutex;
++  static Status cached;
++  static int64_t cached_at = 0;
++  // Rate window: (time, bytes) samples every 250 ms over the last 4 s.
++  static std::deque<std::pair<int64_t, uint64_t>> samples;
++  std::lock_guard<std::mutex> lock(mutex);
++  if (!g_active) return Status{};
++  int64_t now = NowNs();
++  if (now - cached_at < 250'000'000) return cached;
++  cached_at = now;
++
++  Status s;
++  s.active = true;
++  s.online = g_online;
++  s.loading = g_loading;
++  s.fetched = g_stats.bytes;
++  s.errors = g_stats.errors;
++  s.elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_started).count();
++  int64_t since = g_wait_since, last = g_last_fetch;
++  s.waiting_seconds = since ? (now - since) / 1e9 : 0;
++  s.seconds_since_fetch = last ? (now - last) / 1e9 : 1e9;
++
++  samples.emplace_back(now, s.fetched);
++  while (samples.size() > 2 && now - samples.front().first > 4'000'000'000) samples.pop_front();
++  double span = (now - samples.front().first) / 1e9;
++  s.rate = span > 0.5 ? (s.fetched - samples.front().second) / span : 0;
++
++  s.have_plan = !g_plan.empty();
++  s.plan_complete = g_plan_complete;
++  s.plan_missing_at_start = g_plan_missing_at_start;
++  for (const auto& r : g_plan)
++    if (!r.file->HasLocked(r.block)) s.plan_missing += r.file->BlockBytes(r.block);
++  if (s.have_plan) {
++    // The current rate once data is flowing; before that, what the earlier launch saw.
++    double rate = s.rate > 1e6 ? s.rate : (g_plan_rate > 1e6 ? g_plan_rate : 0);
++    s.eta = s.plan_missing == 0 ? 0 : (rate > 0 ? s.plan_missing / rate : -1);
++  }
++  cached = s;
++  return s;
 +}
 +
 +std::unique_ptr<FileHandle> OpenStreamed(const std::filesystem::path& path) {
@@ -2409,9 +2657,11 @@ index 0000000..3bd8d6c
 +  f->pinned = true;
 +  if (!f->complete) {
 +    std::shared_lock<std::shared_mutex> no_evict(f->evict_mutex);
-+    g_foreground++;
-+    bool ok = f->EnsureAll();
-+    g_foreground--;
++    bool ok;
++    {
++      ForegroundWait waiting;
++      ok = f->EnsureAll();
++    }
 +    if (!ok) {
 +      REXFS_ERROR("bridge: could not fetch all of {}", f->label);
 +      return false;

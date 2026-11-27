@@ -55,7 +55,18 @@ if [ "${GTAV_BRIDGE:-0}" = 1 ] || [ -n "${GTAV_BRIDGE_URL:-}" ]; then
   [ "${GTAV_BRIDGE_PREFETCH:-0}" = 1 ] && printf -- '--bridge_prefetch=true\n' >> "$APP/args.txt"
   echo "bridge: $url"
 fi
-if [ -n "${GTAV_SPIRV:-}" ]; then mkdir -p "$APP/spirv" && cp -R "$GTAV_SPIRV/." "$APP/spirv/"; fi
+# Without SPIR-V the renderer skips every draw: the game runs (audio) on a black screen. Default to
+# the Mac's translated shaders in the GTAV.app game folder.
+if [ -z "${GTAV_SPIRV:-}" ]; then
+  gf="$(defaults read io.github.gtav-recomp GameFolder 2>/dev/null || true)"
+  [ -n "$gf" ] && [ -d "$gf/data/spirv" ] && GTAV_SPIRV="$gf/data/spirv"
+fi
+if [ -n "${GTAV_SPIRV:-}" ]; then
+  mkdir -p "$APP/spirv" && cp -R "$GTAV_SPIRV/." "$APP/spirv/"
+  echo "spirv: $(ls "$APP/spirv" | wc -l | tr -d ' ') shaders from $GTAV_SPIRV"
+else
+  echo "warning: no SPIR-V (set GTAV_SPIRV=<game folder>/data/spirv); the game will draw nothing" >&2
+fi
 
 if [ "$SIM" = 1 ]; then
   for d in "$APP"/*.dylib; do codesign --force --sign - --timestamp=none "$d"; done

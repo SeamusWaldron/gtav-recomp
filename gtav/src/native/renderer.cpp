@@ -22,6 +22,9 @@
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#if !defined(_WIN32)
+#include <rex/filesystem/bridge.h>
+#endif
 #include <fmt/ranges.h>
 
 #include <algorithm>
@@ -1305,6 +1308,19 @@ class Renderer {
     }
     if (backend_ok_ && REXCVAR_GET(gtav_native_fps))
       backend_.DrawCounter(list_, fps_value_, 8, 8, std::max(1u, h / 720), kSwapchainFormat);
+#if !defined(_WIN32)
+    // The first load is over once the game draws real scenes: loading screens draw a handful of
+    // quads (6-14 per frame on the 360 boot), the world hundreds. Two seconds of that ends the
+    // data bridge's load list and its loading panel.
+    if (!load_reported_) {
+      busy_frames_ = frame.draws.size() >= 300 ? busy_frames_ + 1 : 0;
+      if (busy_frames_ >= 120) {
+        load_reported_ = true;
+        REXLOG_INFO("[native] first load finished (guest frame {})", frame.index);
+        rex::filesystem::bridge::SetLoaded();
+      }
+    }
+#endif
     if (backend_ok_) {
       double frame_ms = fps_value_ ? 1000.0 / fps_value_ : 0.0;
       if (ImDrawData* menu_data = menu::Frame(w, h, fps_value_, frame_ms))
@@ -1618,6 +1634,8 @@ class Renderer {
   std::atomic<uint64_t> dropped_{0};
   std::chrono::steady_clock::time_point fps_since_ = std::chrono::steady_clock::now();
   uint32_t fps_frames_ = 0, fps_value_ = 0;
+  uint32_t busy_frames_ = 0;    // consecutive presented frames with a real scene
+  bool load_reported_ = false;  // the first load's end was reported (render thread)
   bool vsync_ = true;  // the swap chain's current setting (the menu changes the cvar)
   struct Timing {  // render thread, per 300 presented frames
     double record_sum = 0, record_max = 0, gpu_sum = 0, gpu_max = 0;

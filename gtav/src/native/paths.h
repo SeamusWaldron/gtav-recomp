@@ -52,11 +52,14 @@ inline std::filesystem::path ExeDir() {
 }
 
 // SPIR-V of the game's shaders (census output): <exe dir>/spirv. iPhone release: inside the app
-// bundle (the player's Mac translated them into the ipa); a Documents/spirv (dev builds) wins.
+// bundle (the player's Mac translated them into the ipa); a Documents/spirv (dev builds) wins
+// when it holds anything. An empty one (left by an older dev build's args) used to hide the
+// bundle's shaders, and every draw was skipped.
 inline std::string DefaultSpirvDir() {
 #if defined(__APPLE__) && TARGET_OS_IPHONE
   std::error_code ec;
-  if (!std::filesystem::is_directory(ExeDir() / "spirv", ec)) {
+  auto docs = ExeDir() / "spirv";
+  if (!std::filesystem::is_directory(docs, ec) || std::filesystem::is_empty(docs, ec)) {
     char buf[4096];
     uint32_t size = sizeof(buf);
     if (_NSGetExecutablePath(buf, &size) == 0) return (std::filesystem::path(buf).parent_path() / "spirv").string();
