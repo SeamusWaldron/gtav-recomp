@@ -435,3 +435,37 @@ if(GTAV_IOS)
     set_source_files_properties(src/ios_setup.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     target_link_libraries(gtav PRIVATE "-framework UIKit" "-framework UniformTypeIdentifiers")
 endif()
+
+# visionOS immersive shell (docs/VISIONOS_PLAN.md, phase 2): a SwiftUI app owns main() and opens a
+# full immersive space whose Compositor Services layer shows the game; the SDK's SDL main becomes
+# rex_ios_run_app() (REX_IOS_EXTERNAL_MAIN). GTAV_IMMERSIVE=OFF keeps phase 1's flat window.
+option(GTAV_IMMERSIVE "visionOS: SwiftUI shell with a full immersive space" ON)
+if(GTAV_VISIONOS AND GTAV_IMMERSIVE)
+    # CMake gives swiftc no visionOS target of its own (it falls back to macOS).
+    if(CMAKE_OSX_SYSROOT MATCHES "[Ss]imulator")
+        set(CMAKE_Swift_COMPILER_TARGET "arm64-apple-xros${CMAKE_OSX_DEPLOYMENT_TARGET}-simulator")
+    else()
+        set(CMAKE_Swift_COMPILER_TARGET "arm64-apple-xros${CMAKE_OSX_DEPLOYMENT_TARGET}")
+    endif()
+    enable_language(Swift)
+    # Its own object library: gtav's compile definitions (NAME=value) are not valid swiftc -D flags.
+    add_library(gtav_shell_swift STATIC src/visionos/App.swift)
+    target_compile_options(gtav_shell_swift PRIVATE -parse-as-library "SHELL:-swift-version 5"
+                           "SHELL:-import-objc-header ${CMAKE_CURRENT_SOURCE_DIR}/src/visionos/immersive.h")
+    target_sources(gtav PRIVATE src/visionos/immersive.mm)
+    # Force-loaded: nothing references its @main (the entry point) from the C++ side.
+    target_link_libraries(gtav PRIVATE "-Wl,-force_load,$<TARGET_FILE:gtav_shell_swift>")
+    add_dependencies(gtav gtav_shell_swift)
+    set_source_files_properties(src/visionos/immersive.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_compile_definitions(gtav PRIVATE REX_IOS_EXTERNAL_MAIN=1 GTAV_IMMERSIVE=1)
+    # clang++ links: the Swift objects' autolink entries need the Swift library folders.
+    execute_process(COMMAND xcrun --sdk ${CMAKE_OSX_SYSROOT} --show-sdk-path
+                    OUTPUT_VARIABLE GTAV_XROS_SDK_PATH OUTPUT_STRIP_TRAILING_WHITESPACE)
+    execute_process(COMMAND xcrun --sdk ${CMAKE_OSX_SYSROOT} --find swiftc
+                    OUTPUT_VARIABLE GTAV_SWIFTC OUTPUT_STRIP_TRAILING_WHITESPACE)
+    get_filename_component(GTAV_SWIFT_BIN "${GTAV_SWIFTC}" DIRECTORY)
+    target_link_directories(gtav PRIVATE "${GTAV_XROS_SDK_PATH}/usr/lib/swift"
+                            "${GTAV_SWIFT_BIN}/../lib/swift/xros")
+    target_link_libraries(gtav PRIVATE "-framework SwiftUI" "-framework CompositorServices"
+                          "-framework ARKit" "-framework QuartzCore")
+endif()

@@ -57,12 +57,12 @@
 			<string>ExtendedGamepad</string>
 		</dict>
 	</array>
-	<!-- Phase 1: a window in the Shared Space (SDL's UIKit window). The immersive space comes in
-	     phase 2 (docs/VISIONOS_PLAN.md). -->
+	<!-- Phase 2 (docs/VISIONOS_PLAN.md): the SwiftUI shell opens a launch window, then a full
+	     immersive space (Compositor Services). Its scenes need multiple-scene support. -->
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
-		<false/>
+		<true/>
 		<key>UIApplicationPreferredDefaultSceneSessionRole</key>
 		<string>UIWindowSceneSessionRoleApplication</string>
 	</dict>

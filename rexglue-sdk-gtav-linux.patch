@@ -1488,10 +1488,10 @@ index 4fe1ca6..c5a4199 100644
    // Thread fibers are destroyed from the owning thread itself.
 diff --git a/src/core/filesystem_bridge.cpp b/src/core/filesystem_bridge.cpp
 new file mode 100644
-index 0000000..3a3fcfa
+index 0000000..4923eb6
 --- /dev/null
 +++ b/src/core/filesystem_bridge.cpp
-@@ -0,0 +1,1180 @@
+@@ -0,0 +1,1288 @@
 +/**
 + * @file        core/filesystem_bridge.cpp
 + * @brief       Bridge client: on-demand block streaming of host game data (see bridge.h and
@@ -1538,6 +1538,12 @@ index 0000000..3a3fcfa
 +constexpr uint64_t kSmallFile = 256 * 1024;  // fetched whole at sync (plain fopen readers)
 +constexpr uint64_t kReadAheadBlocks = 4;
 +constexpr uint64_t kMaxRunBlocks = 8;  // largest single Range request
++// Background requests are smaller, so a miss never queues long behind one on the link.
++constexpr uint64_t kPrefetchRunBlocks = 4;
++// After a miss, the blocks that follow it are fetched in the background: open-world streaming
++// mostly reads on through the area it just touched.
++constexpr uint64_t kHintBlocks = 32;
++constexpr size_t kMaxHints = 64;
 +constexpr int kIoTimeoutSeconds = 15;
 +constexpr int kFetchAttempts = 3;
 +constexpr char kMapMagic[8] = {'G', 'T', 'B', 'R', 'M', 'A', 'P', '1'};
@@ -1934,6 +1940,8 @@ index 0000000..3a3fcfa
 +  std::unique_ptr<std::atomic<uint32_t>[]> access;  // last-read tick per block
 +  std::unique_ptr<std::atomic<uint8_t>[]> touched;  // read during this run's load
 +  std::vector<uint8_t> planned;                     // in the earlier launch's load list
++  std::atomic<uint64_t> reads{0};  // reads this run: the background fill takes hot files first
++  std::atomic<uint64_t> sweep{0};  // the background fill's next block
 +
 +  bool Has(uint64_t b) const { return bits[b >> 3] & (1u << (b & 7)); }
 +  bool HasLocked(uint64_t b) {
@@ -1941,6 +1949,7 @@ index 0000000..3a3fcfa
 +    return detached || Has(b);
 +  }
 +  void Touch(uint64_t b0, uint64_t b1);  // records first reads in the load list
++  void Hint(uint64_t from);               // queues the blocks after a miss for the background
 +  uint64_t BlockBytes(uint64_t b) const { return std::min(size - b * kBlock, kBlock); }
 +  // Caller holds mutex (or the file is not shared yet).
 +  uint64_t CachedBytes() const {
@@ -2043,6 +2052,7 @@ index 0000000..3a3fcfa
 +      for (uint64_t b = b0; b <= b1; ++b) access[b].store(tick, std::memory_order_relaxed);
 +    }
 +    if (g_loading.load(std::memory_order_relaxed)) Touch(b0, b1);
++    reads.fetch_add(1, std::memory_order_relaxed);
 +    if (!complete) {
 +      bool missing = false;
 +      {
@@ -2065,6 +2075,7 @@ index 0000000..3a3fcfa
 +                      label, offset, n);
 +          return false;
 +        }
++        Hint(b1 + 1);
 +      }
 +    }
 +    return ReadAll(data_fd, buffer, n, offset, out);
@@ -2376,24 +2387,116 @@ index 0000000..3a3fcfa
 +  return f;
 +}
 +
-+void PrefetchLoop() {
-+  for (auto& f : g_order) {
-+    for (uint64_t b = 0; b < f->nblocks && !g_stop; b += kMaxRunBlocks) {
-+      if (f->complete || f->detached) break;
-+      while (g_foreground > 0 && !g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(20));
-+      // With a cap, fill to 90% and leave the rest for what the game actually reads.
-+      if (g_cap && g_cached >= g_cap / 10 * 9) {
-+        REXFS_INFO("bridge: prefetch stopped at the cache cap ({:.1f} GB)", g_cap / 1e9);
-+        return;
++// Background fill (--bridge_prefetch, on by default). Two workers; each request is one run of up
++// to kPrefetchRunBlocks missing blocks, picked in this order:
++//   1. the blocks after a recent miss (newest first): where the game is about to read;
++//   2. the rest of every file, the files the game has read most first, so in the end the whole
++//      game is on the device and nothing stalls (with a cap, only up to 90% of it).
++// Both workers stand aside while the game waits on a fetch, so they never slow a miss down.
++struct HintRange {
++  StreamFile* file;
++  uint64_t from, to;  // [from, to)
++};
++std::mutex g_hint_mutex;
++std::deque<HintRange> g_hints;
++std::atomic<bool> g_prefetch_on{false};
++
++void StreamFile::Hint(uint64_t from) {
++  if (!g_prefetch_on.load(std::memory_order_relaxed) || from >= nblocks) return;
++  std::lock_guard<std::mutex> lock(g_hint_mutex);
++  // A miss right after one already queued for this file extends nothing: drop the older one.
++  for (auto it = g_hints.begin(); it != g_hints.end(); ++it) {
++    if (it->file == this && from >= it->from && from <= it->to) {
++      g_hints.erase(it);
++      break;
++    }
++  }
++  g_hints.push_front({this, from, std::min(nblocks, from + kHintBlocks)});
++  if (g_hints.size() > kMaxHints) g_hints.pop_back();
++}
++
++// First run of missing, not in-flight blocks in [from, to): false if there is none.
++bool NextMissing(StreamFile& f, uint64_t from, uint64_t to, uint64_t* b0, uint64_t* b1) {
++  std::lock_guard<std::mutex> lock(f.mutex);
++  if (f.detached || f.complete) return false;
++  for (uint64_t b = from; b < to; ++b) {
++    if (f.Has(b) || f.inflight[b]) continue;
++    uint64_t e = b;
++    while (e + 1 < to && e + 1 < b + kPrefetchRunBlocks && !f.Has(e + 1) && !f.inflight[e + 1]) ++e;
++    *b0 = b;
++    *b1 = e;
++    return true;
++  }
++  return false;
++}
++
++bool PickHint(StreamFile** file, uint64_t* b0, uint64_t* b1) {
++  std::lock_guard<std::mutex> lock(g_hint_mutex);
++  while (!g_hints.empty()) {
++    HintRange& h = g_hints.front();
++    if (NextMissing(*h.file, h.from, h.to, b0, b1)) {
++      *file = h.file;
++      h.from = *b1 + 1;
++      if (h.from >= h.to) g_hints.pop_front();
++      return true;
++    }
++    g_hints.pop_front();
++  }
++  return false;
++}
++
++bool PickSweep(StreamFile** file, uint64_t* b0, uint64_t* b1) {
++  // Hottest incomplete file first; ties (unread files) go smallest first.
++  std::vector<StreamFile*> files;
++  for (auto& f : g_order)
++    if (!f->complete && !f->detached && f->sweep < f->nblocks) files.push_back(f.get());
++  std::stable_sort(files.begin(), files.end(), [](StreamFile* a, StreamFile* b) {
++    return a->reads.load(std::memory_order_relaxed) > b->reads.load(std::memory_order_relaxed);
++  });
++  for (StreamFile* f : files) {
++    for (;;) {
++      uint64_t from = f->sweep.load();
++      if (from >= f->nblocks) break;
++      if (!NextMissing(*f, from, f->nblocks, b0, b1)) {
++        f->sweep = f->nblocks;  // nothing left that is not in flight
++        break;
 +      }
-+      if (!f->Ensure(b, std::min(f->nblocks - 1, b + kMaxRunBlocks - 1), 0)) {
-+        std::this_thread::sleep_for(std::chrono::seconds(5));  // server away; try again later
-+        b -= std::min(b, kMaxRunBlocks);
++      if (f->sweep.compare_exchange_strong(from, *b1 + 1)) {
++        *file = f;
++        return true;
 +      }
 +    }
-+    if (g_stop) return;
 +  }
-+  REXFS_INFO("bridge: prefetch finished");
++  return false;
++}
++
++void PrefetchLoop() {
++  bool capped_logged = false;
++  for (;;) {
++    if (g_stop) return;
++    while (g_foreground > 0 && !g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(10));
++    StreamFile* f = nullptr;
++    uint64_t b0 = 0, b1 = 0;
++    bool hint = PickHint(&f, &b0, &b1);
++    // With a cap, fill to 90% and leave the rest for what the game actually reads; the blocks
++    // right after a miss are still worth having.
++    bool capped = g_cap && g_cached >= g_cap / 10 * 9;
++    if (capped && !capped_logged) {
++      capped_logged = true;
++      REXFS_INFO("bridge: background fill stopped at the cache cap ({:.1f} GB)", g_cap / 1e9);
++    }
++    if (!hint && (capped || !PickSweep(&f, &b0, &b1))) {
++      // Nothing to sweep: idle for misses' hints (the cap can also free room again).
++      static std::atomic<bool> finished_logged{false};
++      if (!capped && !finished_logged.exchange(true)) REXFS_INFO("bridge: background fill finished");
++      std::this_thread::sleep_for(std::chrono::milliseconds(100));
++      continue;
++    }
++    if (!f->Ensure(b0, b1, 0)) {
++      if (!hint) f->sweep = std::min(f->sweep.load(), b0);  // retry this run later
++      std::this_thread::sleep_for(std::chrono::seconds(2));  // server away
++    }
++  }
 +}
 +
 +// Keeps the cache under g_cap: drops the least recently read blocks down to 95% of the cap.
@@ -2579,7 +2682,12 @@ index 0000000..3a3fcfa
 +    REXFS_INFO("bridge: cache cap {:.1f} GB", g_cap / 1e9);
 +    std::thread(EvictLoop).detach();
 +  }
-+  if (options.prefetch && online) std::thread(PrefetchLoop).detach();
++  if (options.prefetch && online) {
++    g_prefetch_on = true;
++    REXFS_INFO("bridge: background fill on (2 workers)");
++    std::thread(PrefetchLoop).detach();
++    std::thread(PrefetchLoop).detach();
++  }
 +  return true;
 +}
 +
@@ -4511,7 +4619,7 @@ index 754fa13..b1006d6 100644
      REXSYS_ERROR(
          "GPU plugin '{}' not found at {}. Stage it next to the executable "
 diff --git a/src/system/runtime.cpp b/src/system/runtime.cpp
-index c10694c..9915698 100644
+index c10694c..8b7e4c7 100644
 --- a/src/system/runtime.cpp
 +++ b/src/system/runtime.cpp
 @@ -11,6 +11,7 @@
@@ -4522,22 +4630,23 @@ index c10694c..9915698 100644
  #include <rex/filesystem/devices/host_path_device.h>
  #include <rex/filesystem/devices/null_device.h>
  #include <rex/filesystem/vfs.h>
-@@ -31,6 +32,14 @@
+@@ -31,6 +32,15 @@
  REXCVAR_DEFINE_STRING(game_data_root, "", "Runtime", "Override game data path");
  REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
  REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
 +REXCVAR_DEFINE_STRING(bridge_url, "", "Runtime",
 +                      "Stream game data on demand from a bridge server (tools/bridge), e.g. "
 +                      "http://mymac.local:7360; fetched data is cached in the data folders");
-+REXCVAR_DEFINE_BOOL(bridge_prefetch, false, "Runtime",
-+                    "With bridge_url: fill the local cache in the background while playing");
++REXCVAR_DEFINE_BOOL(bridge_prefetch, true, "Runtime",
++                    "With bridge_url: fill the local cache in the background while playing "
++                    "(after each miss the data that follows it, then whole files, most-read first)");
 +REXCVAR_DEFINE_INT32(bridge_cache_max_gb, 0, "Runtime",
 +                     "With bridge_url: cap the local cache (GB); least recently read data is "
 +                     "dropped and fetched again when needed. 0 = no limit");
  REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
  REXCVAR_DEFINE_STRING(metadata_root, "", "Runtime", "Override metadata path");
  
-@@ -114,6 +123,23 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
+@@ -114,6 +124,23 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
  
    tool_mode_ = config.tool_mode;
  
@@ -4969,7 +5078,7 @@ index dc0b4c2..0742758 100644
    }
    return EXIT_SUCCESS;
 diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
-index 77bb1dc..4b57917 100644
+index 77bb1dc..d5df184 100644
 --- a/src/ui/windowed_app_main_sdl.cpp
 +++ b/src/ui/windowed_app_main_sdl.cpp
 @@ -22,6 +22,11 @@
@@ -4984,7 +5093,7 @@ index 77bb1dc..4b57917 100644
  #if REX_PLATFORM_WIN32
  #ifndef WIN32_LEAN_AND_MEAN
  #define WIN32_LEAN_AND_MEAN
-@@ -124,6 +129,80 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
+@@ -124,6 +129,103 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
    return RunWindowedApp(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
  }
  
@@ -5026,7 +5135,7 @@ index 77bb1dc..4b57917 100644
 +}
 +}  // namespace
 +
-+int main(int argc, char* argv[]) {
++static void PrepareIosArgs(int argc, char* argv[]) {
 +  for (int i = 0; i < argc; ++i) {
 +    g_ios_args.emplace_back(argv[i]);
 +  }
@@ -5059,8 +5168,31 @@ index 77bb1dc..4b57917 100644
 +    g_ios_argv.push_back(arg.data());
 +  }
 +  g_ios_argv.push_back(nullptr);
++}
++
++#if defined(REX_IOS_EXTERNAL_MAIN)
++// SDL's (internal, exported) switch for pumping UIKit from SDL_PumpEvents; its app delegate
++// normally sets it.
++extern "C" void SDL_SetiOSEventPump(bool enabled);
++
++// The app's own main() and UIApplicationMain (a SwiftUI shell: the visionOS immersive space) call
++// this on the main thread from a run-loop callout, once a window scene is connected: the same
++// point SDL's own app delegate starts from (postFinishLaunch). It runs the app's main loop, SDL's
++// nested run loop that keeps UIKit (and SwiftUI) going, and returns when the app quits.
++extern "C" int rex_ios_run_app(int argc, char* argv[]) {
++  PrepareIosArgs(argc, argv);
++  SDL_SetMainReady();
++  SDL_SetiOSEventPump(true);
++  int rc = IosMain(static_cast<int>(g_ios_args.size()), g_ios_argv.data());
++  SDL_SetiOSEventPump(false);
++  return rc;
++}
++#else
++int main(int argc, char* argv[]) {
++  PrepareIosArgs(argc, argv);
 +  return SDL_RunApp(static_cast<int>(g_ios_args.size()), g_ios_argv.data(), IosMain, nullptr);
 +}
++#endif
 +
  #else
  

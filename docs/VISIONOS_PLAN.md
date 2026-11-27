@@ -76,6 +76,28 @@ gtav and plume apply; CMake checks for `CMAKE_SYSTEM_NAME STREQUAL "iOS"` need a
     tools/visionos/push_data.sh (game, update, user: ~15 GB over Wi-Fi), launch, read
     Documents/logs/gtav.log. Things to check first: MoltenVK reports BC support; the guest memory
     mapping succeeds (extended VA); SDL's window appears in the Shared Space.
+- Phase 1 on the device (2026-11-26): boots and plays in SDL's flat window. Game data streams
+  from the Mac over the data bridge (docs/BRIDGE.md); shaders are bundled from the Mac's
+  data/spirv by make_app.sh; DualShock 4 paired to the headset.
+- Phase 2 (2026-11-26), **done on the device**:
+  - Shell: `gtav/src/visionos/App.swift`, a SwiftUI `@main` with a launch window and a full
+    `ImmersiveSpace` holding a `CompositorLayer` (dedicated per-eye textures, no foveation). The
+    SDK's iOS `main()` becomes `rex_ios_run_app()` (`REX_IOS_EXTERNAL_MAIN`). The shell calls it
+    from a run-loop callout once the window scene is connected, the same point SDL's own app
+    delegate starts from. SDL's nested run loop then keeps UIKit and SwiftUI running, so input,
+    audio, lifecycle and the hidden SDL window behave as in phase 1.
+  - Frames: in immersive builds (`GTAV_IMMERSIVE`, default on for visionOS) the native renderer
+    has no swap chain. It renders the frame, menu and loading panel into one of four 1920x1080
+    offscreen images and publishes each, once its slot's fence passed, as the MTLTexture behind
+    it (`VK_EXT_metal_objects`, enabled in plume on Apple). That adds about two game frames of
+    latency; head motion is unaffected, since the compositor runs at its own rate.
+  - Compositor loop (`gtav/src/visionos/immersive.mm`, own thread): ARKit world tracking gives
+    the predicted head pose. Every display frame (90 Hz) it draws the newest game frame, for each
+    eye, on a 3.2 m x 1.8 m screen 3 m ahead at eye height, placed where the player looked when
+    the space opened. The game frame is decoded from gamma, since the drawable is sRGB.
+  - Owner's check: picture and colours right, the screen holds still in the room, size
+    comfortable, controller works.
+  - Not yet: recentring, hiding the launch window behind the space, a mixed (passthrough) mode.
 - Simulator (2026-11-24): simulator builds of the SDK (out/install/xrsim-arm64, REX_PLATFORM
   xrsim-arm64), shell (build/xrsim-shell) and game library (`--visionos --simulator`);
   `tools/visionos/run_sim.sh` (data symlinked from the Mac install, no copy; this Xcode has no

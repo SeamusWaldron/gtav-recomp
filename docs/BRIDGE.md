@@ -120,8 +120,14 @@ finished one.
   works; plane and train Wi-Fi do not).
 - If the Mac is unreachable, the client runs from the cached manifest. Reads of blocks that
   aren't cached fail with a logged error.
-- Optional `--bridge_prefetch=true` fills incomplete files in the background (8 MiB requests). It
-  pauses while the game is waiting on a miss. It is off by default: demand-only first, then measure.
+- The background fill (`--bridge_prefetch`, on by default since 2026-11-26) runs two workers with
+  4 MiB requests. Both stand aside while the game waits on a miss. On the headset, demand-only
+  streaming froze the game for 0.2 to 0.5 s at each miss while driving. In order, the fill takes:
+  1. the 32 MiB after each recent miss, newest first, because open-world streaming mostly reads
+     on through the area it just touched;
+  2. the rest of every file, the files the game has read most first, until the whole game is on
+     the device (with a cap, up to 90% of the cap; after that only the blocks after a miss).
+  `--bridge_prefetch=false` turns it off.
 
 ## Known limits
 

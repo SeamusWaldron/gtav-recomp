@@ -11,6 +11,11 @@
 #include "shader_compiler.h"
 
 #include <plume_render_interface.h>
+#if GTAV_IMMERSIVE
+// visionOS immersive space: the frames go to the compositor loop as MTLTextures, not a swap chain.
+#include <plume_vulkan.h>
+#include "../visionos/immersive.h"
+#endif
 
 #ifdef _WIN32
 // rexruntime.dll links SDL statically and exports none of it, so on Windows the native window is a
@@ -570,7 +575,9 @@ class Renderer {
             if (SDL_Window** windows = SDL_GetWindows(&count)) {
               if (count > 0) {
                 r->window_ = windows[0];
+#if !GTAV_IMMERSIVE  // the immersive space shows the game; the window stays hidden
                 SDL_ShowWindow(r->window_);
+#endif
               }
               SDL_free(windows);
             }
@@ -666,6 +673,14 @@ class Renderer {
     }
     queue_cmd_ = device_->createCommandQueue(plume::RenderCommandListType::DIRECT);
     // Init steps are logged: a cold first boot after a rebuild sometimes never got past here.
+#if GTAV_IMMERSIVE
+    if (immersive_) {
+      menu::LoadSettings();
+      vsync_ = REXCVAR_GET(gtav_native_vsync);
+      CreateImmersiveTargets();
+    } else
+#endif
+    {
     REXLOG_INFO("[native] init: queue created, creating the swap chain");
     swapchain_ = queue_cmd_->createSwapChain(
         plume::RenderSwapChainDesc(
@@ -681,6 +696,7 @@ class Renderer {
     REXLOG_INFO("[native] init: swap chain created, resizing");
     swapchain_->resize();
     REXLOG_INFO("[native] init: swap chain {}x{}", swapchain_->getWidth(), swapchain_->getHeight());
+    }
     for (uint32_t i = 0; i < Backend::kFramesInFlight; i++) {
       lists_[i] = queue_cmd_->createCommandList();
       present_lists_[i] = queue_cmd_->createCommandList();
@@ -688,7 +704,7 @@ class Renderer {
       acquires_[i] = device_->createCommandSemaphore();
       gpu_times_[i] = device_->createQueryPool(2);
     }
-    CreateFramebuffers();
+    if (!immersive_) CreateFramebuffers();
     REXLOG_INFO("[native] init: framebuffers created, backend init");
     backend_ok_ = backend_.Init(device_.get());
     REXLOG_INFO("[native] init: done");
@@ -763,6 +779,55 @@ class Renderer {
       release_.push_back(device_->createCommandSemaphore());
   }
 
+  // The framebuffer of the image this frame draws into (swap chain image or immersive target).
+  plume::RenderFramebuffer* TargetFramebuffer(uint32_t image) {
+#if GTAV_IMMERSIVE
+    if (immersive_) return immersive_fb_[image].get();
+#endif
+    return framebuffers_[image].get();
+  }
+
+#if GTAV_IMMERSIVE
+  // visionOS immersive space: the frame (game, menu, loading panel) goes into one of these
+  // offscreen images and is handed to the compositor loop as its MTLTexture once its slot's fence
+  // passed (Retire). kFramesInFlight are being drawn, one is on show and one may still be sampled
+  // by the compositor's last frame, so the next image to draw is never one it reads.
+  static constexpr uint32_t kImmersiveImages = Backend::kFramesInFlight + 2;
+  static constexpr uint32_t kImmersiveW = 1920, kImmersiveH = 1080;
+  std::unique_ptr<plume::RenderTexture> immersive_tex_[kImmersiveImages];
+  std::unique_ptr<plume::RenderFramebuffer> immersive_fb_[kImmersiveImages];
+  void* immersive_mtl_[kImmersiveImages] = {};
+  uint32_t immersive_next_ = 0;
+  int32_t slot_image_[Backend::kFramesInFlight] = {-1, -1};
+
+  void CreateImmersiveTargets() {
+    auto* vdev = static_cast<plume::VulkanDevice*>(device_.get());
+    auto export_objects =
+        reinterpret_cast<PFN_vkExportMetalObjectsEXT>(vkGetDeviceProcAddr(vdev->vk, "vkExportMetalObjectsEXT"));
+    uint32_t exported = 0;
+    for (uint32_t i = 0; i < kImmersiveImages; i++) {
+      immersive_tex_[i] = device_->createTexture(
+          plume::RenderTextureDesc::ColorTarget(kImmersiveW, kImmersiveH, kSwapchainFormat));
+      const plume::RenderTexture* color = immersive_tex_[i].get();
+      plume::RenderFramebufferDesc desc;
+      desc.colorAttachments = &color;
+      desc.colorAttachmentsCount = 1;
+      immersive_fb_[i] = device_->createFramebuffer(desc);
+      if (!export_objects) continue;
+      VkExportMetalTextureInfoEXT texture = {VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT};
+      texture.image = static_cast<plume::VulkanTexture*>(immersive_tex_[i].get())->vk;
+      texture.plane = VK_IMAGE_ASPECT_PLANE_0_BIT;
+      VkExportMetalObjectsInfoEXT info = {VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT, &texture};
+      export_objects(vdev->vk, &info);
+      immersive_mtl_[i] = (void*)texture.mtlTexture;
+      exported += immersive_mtl_[i] != nullptr;
+    }
+    REXLOG_INFO("[native] init: immersive space: {} offscreen {}x{} targets, {} exported to Metal{}",
+                kImmersiveImages, kImmersiveW, kImmersiveH, exported,
+                export_objects ? "" : " (no vkExportMetalObjectsEXT: the space shows no game)");
+  }
+#endif
+
   // Vulkan pipeline cache, persisted next to the exe so pipelines compiled once load in about a
   // millisecond on later runs. Saved periodically (the game exits without unwinding).
   std::filesystem::path PipelineCachePath() { return ExeDir() / "shader_cache" / "vk_pipelines.bin"; }
@@ -816,6 +881,12 @@ class Renderer {
     if (!in_flight_[slot]) return;
     queue_cmd_->waitForCommandFence(fences_[slot].get());
     in_flight_[slot] = false;
+#if GTAV_IMMERSIVE
+    if (slot_image_[slot] >= 0) {  // that frame is finished: show it
+      gtav_immersive_publish(immersive_mtl_[slot_image_[slot]]);
+      slot_image_[slot] = -1;
+    }
+#endif
     if (gpu_times_[slot] && gpu_timed_[slot]) {
       // GPU time of the slot's frame (first to last command of its main list) and the GPU idle
       // gap since the previous frame ended.
@@ -864,7 +935,7 @@ class Renderer {
                              plume::RenderTextureCopyLocation::Subresource(flick_tex_.get()));
     list_->barriers(plume::RenderBarrierStage::GRAPHICS,
                     plume::RenderTextureBarrier(swap_target_, plume::RenderTextureLayout::COLOR_WRITE));
-    list_->setFramebuffer(framebuffers_[swap_image_].get());
+    list_->setFramebuffer(TargetFramebuffer(swap_image_));
     list_->setViewports(plume::RenderViewport(0, 0, float(w), float(h)));
     list_->setScissors(plume::RenderRect(0, 0, int32_t(w), int32_t(h)));
     flick_index_[slot] = index;
@@ -1050,7 +1121,7 @@ class Renderer {
   // Two frames in flight: frame N+1 is recorded while the GPU runs frame N, so a frame costs
   // max(record, GPU) instead of record + GPU. Shot and dump frames are waited for at once.
   void Present(const FramePacket& frame) {
-    if (vsync_ != REXCVAR_GET(gtav_native_vsync)) {  // switched from the menu
+    if (!immersive_ && vsync_ != REXCVAR_GET(gtav_native_vsync)) {  // switched from the menu
       vsync_ = REXCVAR_GET(gtav_native_vsync);
       submitter_.Drain();
       std::lock_guard lock(present_mutex_);
@@ -1071,7 +1142,7 @@ class Renderer {
       return;
     }
 #endif
-    if (swapchain_->needsResize()) {
+    if (!immersive_ && swapchain_->needsResize()) {
       RetireAll();  // also drains the submit thread
       if (!swapchain_->resize()) {
         framebuffers_.clear();
@@ -1082,7 +1153,7 @@ class Renderer {
       }
       CreateFramebuffers();
     }
-    if (swapchain_->isEmpty()) return;  // minimized
+    if (!immersive_ && swapchain_->isEmpty()) return;  // minimized
     const uint32_t slot = slot_;
     auto wait_start = std::chrono::steady_clock::now();
     Retire(slot);
@@ -1208,6 +1279,13 @@ class Renderer {
     list_ = present_lists_[slot].get();
     list_->begin();
     bool acquired;
+#if GTAV_IMMERSIVE
+    if (immersive_) {
+      image = immersive_next_;
+      immersive_next_ = (immersive_next_ + 1) % kImmersiveImages;
+      acquired = true;
+    } else
+#endif
     {
       std::lock_guard lock(present_mutex_);
       acquired = swapchain_->acquireTexture(acquires_[slot].get(), &image);
@@ -1229,13 +1307,22 @@ class Renderer {
       return;
     }
     auto acquire_end = std::chrono::steady_clock::now();
-    plume::RenderTexture* target = swapchain_->getTexture(image);
+    plume::RenderTexture* target =
+#if GTAV_IMMERSIVE
+        immersive_ ? immersive_tex_[image].get() :
+#endif
+                   swapchain_->getTexture(image);
     swap_target_ = target;
     swap_image_ = image;
     list_->barriers(plume::RenderBarrierStage::GRAPHICS,
                     plume::RenderTextureBarrier(target, plume::RenderTextureLayout::COLOR_WRITE));
-    list_->setFramebuffer(framebuffers_[image].get());
+    list_->setFramebuffer(TargetFramebuffer(image));
+#if GTAV_IMMERSIVE
+    uint32_t w = immersive_ ? kImmersiveW : swapchain_->getWidth();
+    uint32_t h = immersive_ ? kImmersiveH : swapchain_->getHeight();
+#else
     uint32_t w = swapchain_->getWidth(), h = swapchain_->getHeight();
+#endif
     list_->setViewports(plume::RenderViewport(0, 0, float(w), float(h)));
     list_->setScissors(plume::RenderRect(0, 0, int32_t(w), int32_t(h)));
     bool shot = front && WantShot(frame.index);
@@ -1265,7 +1352,7 @@ class Renderer {
                                plume::RenderTextureCopyLocation::Subresource(shot_tex_.get()));
       list_->barriers(plume::RenderBarrierStage::GRAPHICS,
                       plume::RenderTextureBarrier(target, plume::RenderTextureLayout::COLOR_WRITE));
-      list_->setFramebuffer(framebuffers_[image].get());
+      list_->setFramebuffer(TargetFramebuffer(image));
       list_->setViewports(plume::RenderViewport(0, 0, float(w), float(h)));
       list_->setScissors(plume::RenderRect(0, 0, int32_t(w), int32_t(h)));
     }
@@ -1327,10 +1414,22 @@ class Renderer {
         backend_.DrawMenu(list_, menu_data, kSwapchainFormat);
     }
     list_->barriers(plume::RenderBarrierStage::NONE,
-                    plume::RenderTextureBarrier(target, plume::RenderTextureLayout::PRESENT));
+                    plume::RenderTextureBarrier(target, immersive_ ? plume::RenderTextureLayout::SHADER_READ
+                                                                   : plume::RenderTextureLayout::PRESENT));
     list_->end();
     if (backend_ok_) backend_.EndFrame(slot);
     const plume::RenderCommandList* lists = list_;
+#if GTAV_IMMERSIVE
+    if (immersive_) {  // no swap chain: Retire(slot) publishes the image once the fence passed
+      plume::RenderCommandFence* fence = fences_[slot].get();
+      submitter_.Push([this, lists, fence] {
+        const plume::RenderCommandList* l = lists;
+        queue_cmd_->executeCommandLists(&l, 1, nullptr, 0, nullptr, 0, fence);
+      });
+      slot_image_[slot] = int32_t(image);
+    } else
+#endif
+    {
     plume::RenderCommandSemaphore* wait = acquires_[slot].get();
     plume::RenderCommandSemaphore* signal = release_[image].get();
     plume::RenderCommandFence* fence = fences_[slot].get();
@@ -1342,6 +1441,7 @@ class Renderer {
       std::lock_guard lock(present_mutex_);
       swapchain_->present(image, &sg, 1);
     });
+    }
     auto submit_end = std::chrono::steady_clock::now();
     auto present_end = submit_end;
     in_flight_[slot] = true;
@@ -1637,6 +1737,11 @@ class Renderer {
   uint32_t busy_frames_ = 0;    // consecutive presented frames with a real scene
   bool load_reported_ = false;  // the first load's end was reported (render thread)
   bool vsync_ = true;  // the swap chain's current setting (the menu changes the cvar)
+#if GTAV_IMMERSIVE
+  const bool immersive_ = true;  // visionOS immersive shell: offscreen targets, no swap chain
+#else
+  static constexpr bool immersive_ = false;
+#endif
   struct Timing {  // render thread, per 300 presented frames
     double record_sum = 0, record_max = 0, gpu_sum = 0, gpu_max = 0;
     double gpu_frame_sum = 0, gpu_gap_sum = 0;
