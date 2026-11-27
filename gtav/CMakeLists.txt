@@ -70,6 +70,7 @@ set(GTAV_SOURCES
     src/crash_handler.cpp
     src/cutscene_audio_fix.cpp
     src/frame_limit.cpp
+    src/vr_camera.cpp
     src/wait_profile.cpp
     src/gpu_fence_wait.cpp
     src/native/stats.cpp
@@ -83,6 +84,7 @@ set(GTAV_SOURCES
     src/native/deferred_list.cpp
     src/native/textures.cpp
     src/native/write_watch.cpp
+    src/native/camera_watch.cpp
     src/native/shader_compiler.cpp
     src/native/touch_controls.cpp
 )

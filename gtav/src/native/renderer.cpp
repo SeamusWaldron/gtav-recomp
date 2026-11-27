@@ -5,6 +5,7 @@
 #include "backend.h"
 #include "deferred_list.h"
 #include "capture.h"
+#include "camera_watch.h"
 #include "frame.h"
 #include "menu.h"
 #include "paths.h"
@@ -1407,6 +1408,7 @@ class Renderer {
         load_reported_ = true;
         REXLOG_INFO("[native] first load finished (guest frame {})", frame.index);
         rex::filesystem::bridge::SetLoaded();
+        camera_watch::OnFirstLoad();
         if (int32_t after = REXCVAR_GET(gtav_native_dump_after_load); after > 0)
           native_dump_at_ = frame.index + uint64_t(after);
       }
