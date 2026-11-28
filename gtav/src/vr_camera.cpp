@@ -1,7 +1,7 @@
 // gtav - VR phase 3: the player's head turns the game's own camera (see vr_camera.h).
 //
 // The game keeps its viewports in a list at 0x839FF470 + 2144 (count at + 2148); each holds a
-// 944-byte grcViewport at + 16 (camera matrix at + 192: rows right, up, forward, position,
+// 944-byte grcViewport at + 16 (camera matrix at + 192: rows right, up, back, position,
 // big-endian floats, world Z up; view matrix, its inverse, at + 256). Every render phase takes
 // its own copy of a game viewport with sub_832B84C8, through its vtable (sub_826C8000,
 // sub_826C5BD8...). Turning those copies turns the picture; the game viewports themselves, and
@@ -34,6 +34,9 @@ REXCVAR_DEFINE_BOOL(gtav_vr_test_sweep, false, "GTAV",
                     "VR test: swing the game camera 30 degrees left and right every 5 s");
 REXCVAR_DEFINE_BOOL(gtav_vr_restore, true, "GTAV",
                     "VR research: put the camera back when the frame update returns");
+REXCVAR_DEFINE_BOOL(gtav_vr_head_aims, true, "GTAV",
+                    "VR: turn the camera frame itself, so the game aims where the head looks (off: "
+                    "only the picture turns, see gtav_vr_turn_copies)");
 REXCVAR_DEFINE_BOOL(gtav_vr_turn_copies, true, "GTAV",
                     "VR: turn every copy taken of a game viewport (the render phases take "
                     "theirs with sub_832B84C8)");
@@ -79,9 +82,9 @@ bool CurrentRotation(float out[9]) {
     yaw += 30.0 * std::sin(t * 2 * M_PI / 5.0);
   }
   if (yaw == 0) return false;
-  // Turning right by yaw: right' = cos R - sin F, forward' = sin R + cos F, up stays.
+  // Turning right by yaw: right' = cos R + sin B, back' = cos B - sin R, up stays.
   float c = float(std::cos(yaw * M_PI / 180)), s = float(std::sin(yaw * M_PI / 180));
-  const float r[9] = {c, 0, -s, 0, 1, 0, s, 0, c};
+  const float r[9] = {c, 0, s, 0, 1, 0, -s, 0, c};
   std::memcpy(out, r, sizeof(r));
   return true;
 }
@@ -94,7 +97,7 @@ void Log(const uint8_t* before, const uint8_t* after) {
                     std::chrono::steady_clock::now().time_since_epoch())
                     .count();
   if (int64_t prev = last.load(); now != prev && last.compare_exchange_strong(prev, now))
-    REXLOG_INFO("[vr] {} frames turned; forward ({:.3f} {:.3f} {:.3f}) -> ({:.3f} {:.3f} {:.3f})",
+    REXLOG_INFO("[vr] {} frames turned; back ({:.3f} {:.3f} {:.3f}) -> ({:.3f} {:.3f} {:.3f})",
                 frames.exchange(0), FloatBE(before + 32), FloatBE(before + 36),
                 FloatBE(before + 40), FloatBE(after + 32), FloatBE(after + 36), FloatBE(after + 40));
 }
@@ -112,7 +115,7 @@ thread_local bool g_in_view_update = false;
 thread_local bool g_turned = false;
 thread_local uint8_t g_saved[128];
 
-// Turns the camera matrix at m (rows right, up, forward, position) by rot, and when view is set,
+// Turns the camera matrix at m (rows right, up, back, position) by rot, and when view is set,
 // rewrites the view matrix there as its inverse (3x3 transposed, translation -P.axis).
 void Turn(uint8_t* m, const float rot[9], uint8_t* view) {
   using namespace gtav::vr;
@@ -154,7 +157,9 @@ REX_HOOK_RAW(sub_8231E430) {
   const uint32_t self = ctx.r3.u32;
   __imp__sub_8231E430(ctx, base);
   float rot[9];
-  if (!g_in_view_update || self != kCameraObject || !CurrentRotation(rot)) return;
+  if (REXCVAR_GET(gtav_vr_head_aims) || !g_in_view_update || self != kCameraObject ||
+      !CurrentRotation(rot))
+    return;
   uint8_t* m = rex::memory::GuestPtr(base, kCameraMatrix);
   std::memcpy(g_saved, m, 128);
   g_turned = true;
@@ -201,7 +206,9 @@ REX_HOOK_RAW(sub_832B84C8) {
   using namespace gtav::vr;
   const uint32_t dst = ctx.r3.u32, src = ctx.r4.u32;
   __imp__sub_832B84C8(ctx, base);
-  if (!REXCVAR_GET(gtav_vr_turn_copies) || dst == kCameraObject + 2192) return;
+  if (REXCVAR_GET(gtav_vr_head_aims) || !REXCVAR_GET(gtav_vr_turn_copies) ||
+      dst == kCameraObject + 2192)
+    return;
   float rot[9];
   if (!IsGameViewport(base, src) || !CurrentRotation(rot)) return;
   uint8_t* m = rex::memory::GuestPtr(base, dst + 192);
@@ -215,4 +222,32 @@ REX_HOOK_RAW(sub_832B84C8) {
     if (int64_t prev = last.load(); now != prev && last.compare_exchange_strong(prev, now))
       REXLOG_INFO("[vr] {} game viewport copies turned (last into 0x{:08X})", copies.exchange(0), dst);
   }
+}
+
+// The camera update (sub_82376EB8) builds the frame of the active camera on its stack (matrix
+// rows right, forward, up at +16, +32, +48, position at +64: not the viewport's right, up,
+// back), then hands it to sub_8236E880
+// (r4 = frame, r6 = game viewport), which sets the game viewport from it; afterwards the frame is
+// saved for the game logic (aiming reads it). Turned on the way in, everything downstream sees the
+// head: the viewport, the render copies, the culling and the aim.
+REX_EXTERN(__imp__sub_8236E880);
+REX_HOOK_RAW(sub_8236E880) {
+  using namespace gtav::vr;
+  float rot[9];
+  if (REXCVAR_GET(gtav_vr_head_aims) && CurrentRotation(rot)) {
+    uint8_t* frame = rex::memory::GuestPtr(base, ctx.r4.u32);
+    // As right, up, back rows (the order Turn and the head rotation use), and back again.
+    uint8_t m[64], before[64];
+    std::memcpy(m, frame + 16, 16);
+    std::memcpy(m + 16, frame + 48, 16);
+    for (int i = 0; i < 3; ++i) StoreFloatBE(m + 32 + 4 * i, -FloatBE(frame + 32 + 4 * i));
+    std::memcpy(m + 48, frame + 64, 16);
+    std::memcpy(before, m, 64);
+    Turn(m, rot, nullptr);
+    std::memcpy(frame + 16, m, 12);
+    std::memcpy(frame + 48, m + 16, 12);
+    for (int i = 0; i < 3; ++i) StoreFloatBE(frame + 32 + 4 * i, -FloatBE(m + 32 + 4 * i));
+    if (REXCVAR_GET(gtav_vr_log)) Log(before, m);
+  }
+  __imp__sub_8236E880(ctx, base);
 }

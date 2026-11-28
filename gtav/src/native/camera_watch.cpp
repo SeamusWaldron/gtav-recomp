@@ -39,11 +39,14 @@ REXCVAR_DEFINE_BOOL(gtav_vr_watch_source, false, "GTAV",
 REXCVAR_DEFINE_INT32(gtav_vr_watch_seconds, 5, "GTAV",
                      "VR research (macOS): how long --gtav_vr_watch_camera watches for writes");
 
-#if defined(__APPLE__) && defined(__aarch64__)
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
+#if defined(__APPLE__) && defined(__aarch64__) && TARGET_OS_OSX
 
 #include "safe_read.h"
 
-#include <TargetConditionals.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <signal.h>

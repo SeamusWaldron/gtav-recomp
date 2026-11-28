@@ -1,6 +1,6 @@
 #pragma once
 // gtav - VR phase 3 research: find the guest function that writes the render viewport's camera
-// matrix (docs/VR_CAMERA.md). macOS arm64 only; a no-op elsewhere.
+// matrix (docs/VR_CAMERA.md). macOS arm64 only; a no-op elsewhere (visionOS included).
 
 namespace gtav::native::camera_watch {
 

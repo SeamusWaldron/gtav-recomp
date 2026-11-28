@@ -27,8 +27,8 @@ leaked source.
 ## Findings (Mac dev build, story-mode spawn, 2026-11-26)
 
 - **The camera's world matrix is vertex constants c12..c15** of the world draws. The rows are
-  right, up, forward and position; the world is Z up. In one frame: right (0.854, 0.520, 0), up
-  (0.002, -0.004, 1.000), forward (0.520, -0.854, -0.004), position (5314.0, -5214.3, 83.6). vs c0
+  right, up, back and position; the world is Z up. In one frame: right (0.854, 0.520, 0), up
+  (0.002, -0.004, 1.000), back (0.520, -0.854, -0.004), position (5314.0, -5214.3, 83.6). vs c0
   is the object's world matrix (its position is a few metres from the camera).
 - In memory the matrix has about 2900 copies. Most are in `0x079xxxxx..0x07Fxxxxx`, which looks
   like the command buffer's constant uploads (one per draw that sets it). The copies outside that
@@ -68,7 +68,7 @@ leaked source.
 
 `sub_825A2860` marks the frame update on its thread and, when it returns, puts the matrix back.
 `sub_8231E430`, when called on `0x839FF470` inside that update, turns the matrix it just copied
-(right, up and forward; the position stays). The viewport, the CPU frustum and every render
+(right, up and back; the position stays). The viewport, the CPU frustum and every render
 phase see the turned camera; the camera system and the game's logic never do, and nothing
 accumulates. Tests on the Mac: `--gtav_vr_test_yaw=30` (degrees right),
 `--gtav_vr_test_sweep=true` (30 degrees either way every 5 s), `--gtav_vr_log=true`. The headset
@@ -94,13 +94,41 @@ points at (`phase + 996`) into `phase + 32`, with the same `sub_832B84C8`, from 
 the frame update and putting them back did not turn the picture either: the phases copy later.
 
 The hook on `sub_832B84C8` turns every copy whose source is a game viewport: the camera matrix
-(right, up, forward; the position stays) and the view matrix rewritten as its inverse (checked at
+(right, up, back; the position stays) and the view matrix rewritten as its inverse (checked at
 run time: the game's own view matrix matches that inverse to 0.0005). About 13 copies a frame.
 With `--gtav_vr_test_sweep=true` the picture pans 30 degrees either way with the player standing
 still, cleanly. At 180 degrees the picture is heavily blurred and over-exposed: motion blur (and
 probably auto-exposure) compare against an unturned previous frame. Not yet checked: whether a
 game-logic copy is among those turned (aiming, the HUD's world-to-screen), and whether shadows
 and reflections follow correctly.
+
+### The third row is back, not forward (2026-11-27, on the headset)
+
+right x up = the third row, so the camera looks along minus it: the rows are right, up, back,
+the same axes as ARKit's (x right, y up, z back). The first headset build flipped z when handing
+the head rotation over, and yaw and pitch came out reversed (roll was right, as a z flip predicts).
+`immersive.mm` now passes the head rotation relative to the screen pose as it is.
+
+### Head aims: turning the camera frame (2026-11-27)
+
+Turning only the render copies put the crosshair where the head looked, but shots went where the
+unturned camera pointed: aim and the HUD read the game's camera frame, not the viewports. So the
+default hook (`gtav_vr_head_aims`, on) turns the frame itself, before the game builds the viewport
+from it:
+
+- `sub_82376EB8` is the camera update. It builds a frame on its stack (rows right, forward, up at
+  +16, +32, +48; position at +64; fov at +96), runs cut detection (`sub_8231DD28`), then calls
+  `sub_8236E880(0x839FF3F4, frame, ..., viewport)`, its only caller, to fill the viewport. It then
+  copies the viewport into the double buffer at `0x839FF470 + idx*944` and the frame to the
+  global at `0x838E3140`, which game logic and aim read.
+- The hook on `sub_8236E880` turns the frame's three rows (converted to right, up, back and back
+  again) before the original runs, so the viewport, the global frame and everything after them
+  follow the head. With the hook on, the copy and `+2384` turns are skipped.
+- It does not feed back: on the Mac, with a fixed 30 degree test yaw, the unturned base settled at
+  the same direction as with no hook, and the turned one stayed exactly 30 degrees from it.
+
+Not yet confirmed on the headset: shots landing on the dot, no drift while using the stick, and
+recentre.
 
 ## Plan for the hook
 

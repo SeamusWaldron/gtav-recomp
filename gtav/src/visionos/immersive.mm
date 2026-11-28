@@ -21,6 +21,8 @@
 
 #include <rex/logging.h>
 
+#include "../vr_camera.h"
+
 namespace {
 
 constexpr float kScreenDistance = 3.0f;  // metres in front of the player
@@ -89,6 +91,19 @@ simd_float4x4 PlaceScreen(simd_float4x4 head) {
   simd_float3 center = position + forward * kScreenDistance;
   return simd_matrix(simd_make_float4(x, 0), simd_make_float4(y, 0), simd_make_float4(z, 0),
                      simd_make_float4(center, 1));
+}
+
+// Phase 3: the head's rotation relative to the screen (the recentre pose, levelled) turns the
+// game camera. ARKit axes are x right, y up, z back, and so are the game camera's rows (right,
+// up, back), so the relative rotation goes over as it is.
+void SendHeadRotation(simd_float4x4 screen, simd_float4x4 head) {
+  simd_float3x3 ref = simd_matrix(screen.columns[0].xyz, screen.columns[1].xyz, screen.columns[2].xyz);
+  simd_float3x3 rot = simd_matrix(head.columns[0].xyz, head.columns[1].xyz, head.columns[2].xyz);
+  simd_float3x3 rel = simd_mul(simd_transpose(ref), rot);  // head axes in screen coordinates
+  float out[9];
+  for (int c = 0; c < 3; ++c)
+    for (int i = 0; i < 3; ++i) out[3 * c + i] = rel.columns[c][i];
+  gtav::vr::SetHeadRotation(out);
 }
 
 // Both sticks pressed on any connected controller (read directly, beside SDL's own reading).
@@ -238,6 +253,7 @@ extern "C" void gtav_immersive_run(cp_layer_renderer_t layer) {
             REXLOG_INFO("[immersive] screen placed {:.2f} m ahead at height {:.2f} m{}", kScreenDistance, height,
                         frames ? " (recentred)" : "");
           }
+          SendHeadRotation(screen, head);
         }
         for (size_t v = 0, n = cp_drawable_get_view_count(drawable); v < n; ++v) {
           cp_view_t view = cp_drawable_get_view(drawable, v);
